@@ -267,6 +267,12 @@ contract PagesEdgesTest is Fixture {
         (,, uint256 escrow, uint64 since) = pages.subjects(subject);
         assertEq(escrow, 0);
         assertEq(since, 0, "no escrow clock was ever started");
+        // the payout record names the asker with nothing to give back, and there is nothing to settle
+        (address owedTo, uint96 owedBack) = pages.settlements(subject);
+        assertEq(owedTo, bob);
+        assertEq(owedBack, 0);
+        vm.expectRevert(MarginaliaPages.NothingToSettle.selector);
+        pages.settleClaim(subject);
         (, uint256 fee) = pages.buyPrice(subject, 1);
         vm.prank(alice);
         pages.buy(subject, 1, type(uint256).max);
@@ -293,6 +299,11 @@ contract PagesEdgesTest is Fixture {
         uint256 bobBefore = imd.balanceOf(bob);
         uint256 carolBefore = imd.balanceOf(carol);
         assertTrue(_deliver(id, _att(keccak256("u1"), carol)));
+        (address owedTo, uint96 owedBack) = pages.settlements(subject);
+        assertEq(owedTo, bob);
+        assertEq(owedBack, escrow, "the whole escrow is the reimbursement");
+        vm.prank(dave); // anyone settles
+        pages.settleClaim(subject);
         assertEq(imd.balanceOf(bob) - bobBefore, escrow, "the asker is made whole");
         assertEq(imd.balanceOf(carol), carolBefore, "the owner gets what is left: nothing");
         assertEq(pages.payeeOf(subject), carol);
@@ -311,6 +322,9 @@ contract PagesEdgesTest is Fixture {
         uint256 bobBefore = imd.balanceOf(bob);
         uint256 carolBefore = imd.balanceOf(carol);
         assertTrue(_deliver(id, _att(keccak256("u1"), carol)));
+        (, uint96 owedBack) = pages.settlements(subject);
+        assertEq(owedBack, 0, "no partial reimbursement is recorded");
+        pages.settleClaim(subject);
         assertEq(imd.balanceOf(bob), bobBefore, "no partial reimbursement");
         assertEq(imd.balanceOf(carol) - carolBefore, escrow);
     }
@@ -529,8 +543,186 @@ contract PagesEdgesTest is Fixture {
         assertEq(imd.balanceOf(owner), 0);
         (,, uint256 escrow,) = pages.subjects(subject);
         assertTrue(_deliver(id, _att(keccak256("u"), owner)), "200k stipend with the live hook's imd() read");
+        assertEq(imd.balanceOf(dave), 0, "the callback pays nobody");
+        assertEq(imd.balanceOf(owner), 0);
+        // settlement by a stranger pays both cold balances
+        address stranger = makeAddr("stranger");
+        vm.prank(stranger);
+        pages.settleClaim(subject);
         assertEq(imd.balanceOf(dave), PRICE);
         assertEq(imd.balanceOf(owner), escrow - PRICE);
+        assertEq(imd.balanceOf(stranger), 0, "the settler earns nothing");
+    }
+
+    // ------------------------------------------------------------------ settlement
+
+    function testOwnerWhoAskedCollectsEscrowAndReimbursementInOneSettlement() public {
+        bytes32 subject = pages.subjectOfHandle("selfask");
+        vm.prank(alice);
+        pages.buy(subject, 20, type(uint256).max);
+        (,, uint256 escrow,) = pages.subjects(subject);
+        assertGt(escrow, PRICE);
+        uint256 carolBefore = imd.balanceOf(carol);
+        vm.prank(carol);
+        bytes32 id = pages.requestClaim("selfask", 1);
+        assertTrue(_deliver(id, _att(keccak256("u"), carol)));
+        assertEq(imd.balanceOf(carol), carolBefore - PRICE, "the callback moves nothing");
+        pages.settleClaim(subject);
+        assertEq(
+            imd.balanceOf(carol), carolBefore - PRICE + escrow, "the price back plus the rest: all of it"
+        );
+        vm.expectRevert(MarginaliaPages.NothingToSettle.selector);
+        pages.settleClaim(subject);
+    }
+
+    function testClaimedButUnsettledHandleIsClosedToEveryOtherPathAndFrozen() public {
+        bytes32 subject = pages.subjectOfHandle("frozen");
+        vm.prank(alice);
+        pages.buy(subject, 20, type(uint256).max);
+        (,, uint256 escrow, uint64 since) = pages.subjects(subject);
+        vm.prank(bob);
+        bytes32 id = pages.requestClaim("frozen", 1);
+        assertTrue(_deliver(id, _att(keccak256("u"), carol)));
+        // between the callback and the settlement nothing else can touch the claim or its escrow
+        vm.prank(bob);
+        vm.expectRevert(MarginaliaPages.AlreadyClaimed.selector);
+        pages.requestClaim("frozen", 2);
+        vm.expectRevert(MarginaliaPages.UnknownRequest.selector);
+        pages.abandonClaim(subject);
+        vm.warp(vm.getBlockTimestamp() + pages.CLAIM_WINDOW() + 1);
+        vm.expectRevert(MarginaliaPages.NothingToRecycle.selector);
+        pages.recycle(subject);
+        // trades pay carol directly and the escrow keeps its clock and amount
+        uint256 carolBefore = imd.balanceOf(carol);
+        (, uint256 fee) = pages.sellPrice(subject, 5);
+        vm.prank(alice);
+        pages.sell(subject, 5, 0);
+        assertEq(imd.balanceOf(carol) - carolBefore, fee * 9000 / 10_000);
+        (,, uint256 held, uint64 stillSince) = pages.subjects(subject);
+        assertEq(held, escrow);
+        assertEq(stillSince, since);
+        // the settlement pays exactly what the claim found: the later trade did not change it
+        uint256 bobBefore = imd.balanceOf(bob);
+        carolBefore = imd.balanceOf(carol);
+        pages.settleClaim(subject);
+        assertEq(imd.balanceOf(bob) - bobBefore, PRICE);
+        assertEq(imd.balanceOf(carol) - carolBefore, escrow - PRICE);
+        (,, held, stillSince) = pages.subjects(subject);
+        assertEq(held, 0);
+        assertEq(stillSince, 0);
+        assertEq(imd.balanceOf(address(pages)), pages.reserveOf(subject) + pages.pendingBurn());
+    }
+
+    // ------------------------------------------------------------------ the escrow window's edge
+
+    function testAccrualOneSecondBeforeTheWindowEndsKeepsTheClockAndAtItRestartsIt() public {
+        bytes32 keeps = pages.subjectOfHandle("keeps");
+        bytes32 restarts = pages.subjectOfHandle("restarts");
+        uint256 t0 = vm.getBlockTimestamp();
+        vm.startPrank(alice);
+        pages.buy(keeps, 1, type(uint256).max);
+        pages.buy(restarts, 1, type(uint256).max);
+        (,, uint256 dust,) = pages.subjects(keeps);
+        vm.warp(t0 + pages.CLAIM_WINDOW() - 1);
+        pages.buy(keeps, 10, type(uint256).max);
+        (,, uint256 escrowKeeps, uint64 sinceKeeps) = pages.subjects(keeps);
+        assertEq(sinceKeeps, t0, "inside the window the first buy's clock stands");
+        vm.warp(t0 + pages.CLAIM_WINDOW());
+        pages.buy(restarts, 10, type(uint256).max);
+        (,, uint256 escrowRestarts, uint64 sinceRestarts) = pages.subjects(restarts);
+        assertEq(sinceRestarts, t0 + pages.CLAIM_WINDOW(), "at the window's end a new accrual restarts it");
+        assertEq(escrowRestarts, escrowKeeps, "the same accruals in both");
+        assertGt(escrowRestarts, dust);
+        vm.stopPrank();
+        // the one that kept its clock is recyclable now, the whole amount; the restarted one waits a window
+        uint256 poolsBefore = _pools();
+        pages.recycle(keeps);
+        assertEq(_pools() - poolsBefore, escrowKeeps);
+        vm.expectRevert(MarginaliaPages.TooEarly.selector);
+        pages.recycle(restarts);
+        vm.warp(t0 + 2 * pages.CLAIM_WINDOW() - 1);
+        vm.expectRevert(MarginaliaPages.TooEarly.selector);
+        pages.recycle(restarts);
+        vm.warp(t0 + 2 * pages.CLAIM_WINDOW());
+        poolsBefore = _pools();
+        pages.recycle(restarts);
+        assertEq(_pools() - poolsBefore, escrowRestarts, "the old dust is recycled with the new accrual");
+    }
+
+    // ------------------------------------------------------------------ the burn's block budget
+
+    function testBurnLimitIsTheAnchorMovedByTheBoundAndTheAnchorIsTheBlocksFirstPrice() public {
+        bytes32 subject = pages.subjectOf(carol);
+        vm.prank(alice);
+        pages.buy(subject, 100, type(uint256).max);
+        (uint160 limit, uint160 current, bool zeroForOne) = pages.burnLimit();
+        assertTrue(pages.burnAnchorBlock() != block.number, "no anchor before the block's first burn");
+        uint256 expected = zeroForOne
+            ? uint256(current) * (10_000 - pages.BURN_SQRT_BPS()) / 10_000
+            : uint256(current) * (10_000 + pages.BURN_SQRT_BPS()) / 10_000;
+        assertEq(limit, expected, "a fresh block measures from the current price");
+        uint256 half = pages.pendingBurn() / 2;
+        (uint256 spent,) = pages.burnPending(half);
+        assertEq(spent, half);
+        assertEq(pages.burnAnchorBlock(), block.number);
+        assertEq(pages.burnAnchorSqrtPrice(), current, "the anchor is the price the first burn found");
+        (uint160 limit2, uint160 moved,) = pages.burnLimit();
+        assertEq(limit2, limit, "the second burn in the block measures from the same anchor");
+        assertTrue(zeroForOne ? moved < current : moved > current, "the burn moved the price");
+        assertTrue(zeroForOne ? moved > limit : moved < limit, "but not past the bound");
+        uint256 rest = pages.pendingBurn();
+        (spent,) = pages.burnPending(rest);
+        assertEq(spent, rest);
+        assertEq(pages.pendingBurn(), 0);
+    }
+
+    function testExternalTradePastTheBoundSpendsTheBlocksBudgetByNameUntilTheNextBlock() public {
+        bytes32 subject = pages.subjectOf(carol);
+        vm.prank(alice);
+        pages.buy(subject, 100, type(uint256).max);
+        uint256 pending = pages.pendingBurn();
+        (uint256 spent,) = pages.burnPending(pending / 4);
+        assertEq(spent, pending / 4);
+        (uint160 limit,, bool zeroForOne) = pages.burnLimit();
+        // somebody else buys MARG hard in the same block: the price passes the burn's bound on its own
+        _buy(bob, 1_000_000 ether);
+        (, uint160 pushed,) = pages.burnLimit();
+        assertTrue(zeroForOne ? pushed < limit : pushed > limit);
+        uint256 left = pages.pendingBurn();
+        vm.expectRevert(MarginaliaPages.BurnBudgetSpent.selector);
+        pages.burnPending(left);
+        vm.expectRevert(MarginaliaPages.BurnBudgetSpent.selector);
+        pages.burnPending(1);
+        assertEq(pages.pendingBurn(), left, "nothing left the queue");
+        // the next block anchors at the pushed price and burns again, at that price
+        vm.roll(block.number + 1);
+        (uint160 limit2, uint160 current2,) = pages.burnLimit();
+        assertEq(current2, pushed);
+        assertTrue(zeroForOne ? limit2 < pushed : limit2 > pushed);
+        (spent,) = pages.burnPending(left);
+        assertEq(spent, left, "a small tranche fits the new block's bound");
+        assertEq(pages.pendingBurn(), 0);
+    }
+
+    function testBurnPendingRefusesZeroAndOneWeiOverTheQueue() public {
+        vm.expectRevert(MarginaliaPages.InsufficientBurn.selector);
+        pages.burnPending(1); // an empty queue
+        bytes32 subject = pages.subjectOf(carol);
+        vm.prank(alice);
+        pages.buy(subject, 1, type(uint256).max);
+        uint256 pending = pages.pendingBurn();
+        assertEq(pending, 0.1 ether / 10 * 500 / 10_000);
+        vm.expectRevert(MarginaliaPages.ZeroAmount.selector);
+        pages.burnPending(0);
+        vm.expectRevert(MarginaliaPages.InsufficientBurn.selector);
+        pages.burnPending(pending + 1);
+        vm.expectRevert(MarginaliaPages.InsufficientBurn.selector);
+        pages.burnPending(type(uint256).max);
+        (uint256 spent, uint256 burned) = pages.burnPending(pending);
+        assertEq(spent, pending);
+        assertGt(burned, 0);
+        vm.expectRevert(MarginaliaPages.InsufficientBurn.selector);
+        pages.burnPending(1);
     }
 
     function testStrangersCannotCallTheCallbacksOrMoveValue() public {
@@ -549,7 +741,7 @@ contract PagesEdgesTest is Fixture {
         vm.expectRevert(MarginaliaPages.OnlyIntake.selector);
         pages.onOracleResult(id, a, sig);
         // the pool manager's callback outside a burn, from the manager itself and from anyone else
-        bytes memory tranche = abi.encode(pages.pendingBurn(), uint256(1));
+        bytes memory tranche = abi.encode(pages.pendingBurn());
         vm.prank(address(manager));
         vm.expectRevert(MarginaliaPages.UnauthorizedCallback.selector);
         pages.unlockCallback(tranche);

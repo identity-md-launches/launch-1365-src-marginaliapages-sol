@@ -11,22 +11,24 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 /// @dev Drives MarginaliaPages against the real local PoolManager, hook and pool with bounded inputs and four
 /// actors: buys and sells on six subjects (two address issuers, the zero subject, three handles), oracle claims
-/// (good, zero, tampered, thin, stale, wrong signer), abandonment, recycling, MARG burns and time. Every call the
-/// handler makes either succeeds and is checked, or is a deliberate refusal whose reason is asserted, so the
-/// suite runs with fail-on-revert. A separate ledger (the ghosts) records what the market should hold.
+/// (good, zero, tampered, thin, stale, wrong signer), settlement, abandonment, recycling, bounded MARG burns
+/// and time. Every call the handler makes either succeeds and is checked, or is a deliberate refusal whose
+/// reason is asserted, so the suite runs with fail-on-revert. A separate ledger (the ghosts) records what the
+/// market should hold.
 contract PagesHandler is Test {
     MarginaliaPages public immutable pages;
     ClaimIntake public immutable intake;
     MockERC20 public immutable imd;
     IERC20 public immutable marg;
+    address public immutable manager;
     uint256 internal immutable signerKey;
 
     address[4] public actors;
     bytes32[] public subjects;
     string[3] internal handles;
     uint256 public constant HANDLE_OFFSET = 3;
-    /// @dev The smallest burn tranche the handler asks for: the smallest fee share is 5e14 wei, and below a
-    /// few hundred wei the pool's fee rounding leaves no output at all.
+    /// @dev The smallest burn tranche the handler asks for: the smallest fee share is 5e14 wei, and a wei or
+    /// two is eaten whole by the pool's LP fee and returns no MARG.
     uint256 public constant MIN_TRANCHE = 1e12;
 
     // ------------------------------------------------------------------ ghosts
@@ -39,12 +41,15 @@ contract PagesHandler is Test {
     mapping(bytes32 => address) public ghostClaimant;
     mapping(bytes32 => uint256) public ghostPrice;
     mapping(bytes32 => uint256) public ghostRequestedAt;
+    /// @dev A successful claim's payout waiting for settleClaim: who asked and what the escrow owes them back.
+    mapping(bytes32 => address) public ghostSettleTo;
+    mapping(bytes32 => uint256) public ghostReimbursed;
+    mapping(bytes32 => bool) public ghostUnsettled;
     uint256 public ghostPendingBurn;
     uint256 public ghostIn; // IMD the market took from traders
     uint256 public ghostOut; // IMD the market paid out: sellers, issuers, pools, claims, recycling, burns
     uint256 public ghostPools; // IMD handed to the hook's pools (fees and recycling)
     uint256 public ghostMargBurned;
-    uint256 public ghostMargFloor;
     uint256 public ghostImdBurned;
     bytes32[] public consumedUuids;
     uint256 internal uuidNonce;
@@ -56,10 +61,13 @@ contract PagesHandler is Test {
     uint256 public requests;
     uint256 public claimsSucceeded;
     uint256 public claimsFailed;
+    uint256 public settlements;
     uint256 public answersRefused;
     uint256 public abandons;
     uint256 public recycles;
     uint256 public burns;
+    uint256 public partialFills;
+    uint256 public budgetRefusals;
 
     constructor(
         MarginaliaPages pages_,
@@ -74,6 +82,7 @@ contract PagesHandler is Test {
         intake = intake_;
         imd = imd_;
         marg = marg_;
+        manager = address(pages_.hook().poolManager());
         signerKey = signerKey_;
         actors = actors_;
         handles[0] = "writer_one";
@@ -122,7 +131,12 @@ contract PagesHandler is Test {
         if (payee != address(0)) {
             ghostOut += toIssuer;
         } else {
-            if (ghostEscrowSince[subject] == 0) ghostEscrowSince[subject] = _now();
+            // the window runs from the first buy of the escrow being accumulated; a share landing after it
+            // elapsed opens a new one
+            if (ghostEscrowSince[subject] == 0 || _now() >= ghostEscrowSince[subject] + pages.CLAIM_WINDOW())
+            {
+                ghostEscrowSince[subject] = _now();
+            }
             ghostEscrow[subject] += toIssuer;
         }
         ghostPendingBurn += toBurn;
@@ -170,6 +184,7 @@ contract PagesHandler is Test {
         );
         address payee = pages.payeeOf(subject);
         uint256 before = imd.balanceOf(actor);
+        uint256 escrowBefore = ghostEscrow[subject];
         vm.prank(actor);
         pages.buy(subject, amount, value + fee);
         uint256 paid = before - imd.balanceOf(actor);
@@ -179,6 +194,9 @@ contract PagesHandler is Test {
         ghostSupply[subject] += amount;
         ghostPages[subject][actor] += amount;
         _feeGhost(subject, fee, payee);
+        if (payee != address(0)) {
+            assertEq(ghostEscrow[subject], escrowBefore, "a paid subject escrows nothing");
+        }
         buys++;
     }
 
@@ -281,7 +299,6 @@ contract PagesHandler is Test {
         address claimant = ghostClaimant[subject];
         uint256 escrow = ghostEscrow[subject];
         uint256 reimbursed = escrow >= ghostPrice[subject] ? ghostPrice[subject] : 0;
-        uint256 owed = escrow - reimbursed;
         uint256 claimantBefore = imd.balanceOf(claimant);
         uint256 walletBefore = wallet == address(0) ? 0 : imd.balanceOf(wallet);
         uint256 pagesBefore = imd.balanceOf(address(pages));
@@ -291,6 +308,8 @@ contract PagesHandler is Test {
         assertFalse(intake.deliver(address(pages), id, a, sig), "a replay is refused");
         (bytes32 pending,,,) = pages.claims(subject);
         assertEq(pending, bytes32(0), "the claim is closed either way");
+        assertEq(imd.balanceOf(address(pages)), pagesBefore, "the callback only verifies and stores");
+        assertEq(imd.balanceOf(claimant), claimantBefore, "nothing is paid inside the callback");
         consumedUuids.push(a.requestId);
         delete ghostPending[subject];
         delete ghostClaimant[subject];
@@ -298,22 +317,23 @@ contract PagesHandler is Test {
         delete ghostRequestedAt[subject];
         if (wallet == address(0)) {
             assertEq(pages.payeeOf(subject), address(0), "a zero answer names nobody");
-            assertEq(imd.balanceOf(address(pages)), pagesBefore, "a failed claim moves nothing");
-            assertEq(imd.balanceOf(claimant), claimantBefore, "the asker is not reimbursed");
+            (address nobody, uint96 nothing) = pages.settlements(subject);
+            assertEq(nobody, address(0), "a failed claim records no payout");
+            assertEq(nothing, 0);
             claimsFailed++;
             return;
         }
         assertEq(pages.payeeOf(subject), wallet, "the answer is the payee");
-        assertEq(pagesBefore - imd.balanceOf(address(pages)), escrow, "the whole escrow leaves");
-        if (claimant == wallet) {
-            assertEq(imd.balanceOf(wallet) - walletBefore, escrow);
-        } else {
-            assertEq(imd.balanceOf(claimant) - claimantBefore, reimbursed, "the asker gets the price back");
-            assertEq(imd.balanceOf(wallet) - walletBefore, owed, "the owner gets the rest");
-        }
+        assertEq(imd.balanceOf(wallet), walletBefore, "the owner is paid by settlement, not the callback");
+        (,, uint256 frozen,) = pages.subjects(subject);
+        assertEq(frozen, escrow, "the escrow waits for settlement");
+        (address owedTo, uint96 owedBack) = pages.settlements(subject);
+        assertEq(owedTo, claimant, "the asker is remembered");
+        assertEq(owedBack, reimbursed, "the price comes back only if the escrow covers it");
         ghostPayee[subject] = wallet;
-        ghostEscrow[subject] = 0;
-        ghostOut += escrow;
+        ghostSettleTo[subject] = claimant;
+        ghostReimbursed[subject] = reimbursed;
+        ghostUnsettled[subject] = true;
         claimsSucceeded++;
         // one successful claim per subject, ever
         string memory handle = handles[idx];
@@ -355,6 +375,44 @@ contract PagesHandler is Test {
         answersRefused++;
     }
 
+    /// @dev Anyone pays out a successful claim, once: the escrow to the owner less the price back to the asker.
+    function settle(uint256 subjectSeed) external {
+        bytes32 subject = subjects[subjectSeed % subjects.length];
+        bytes memory data = abi.encodeCall(MarginaliaPages.settleClaim, (subject));
+        if (!ghostUnsettled[subject] || (ghostEscrow[subject] == 0 && ghostReimbursed[subject] == 0)) {
+            // address subjects, unclaimed handles, settled claims and a claim that found an empty escrow
+            _refused(actors[2], data, MarginaliaPages.NothingToSettle.selector);
+            return;
+        }
+        address wallet = ghostPayee[subject];
+        address asker = ghostSettleTo[subject];
+        uint256 escrow = ghostEscrow[subject];
+        uint256 back = ghostReimbursed[subject];
+        uint256 walletBefore = imd.balanceOf(wallet);
+        uint256 askerBefore = imd.balanceOf(asker);
+        uint256 pagesBefore = imd.balanceOf(address(pages));
+        vm.prank(actors[2]); // anyone
+        pages.settleClaim(subject);
+        assertEq(pagesBefore - imd.balanceOf(address(pages)), escrow, "exactly the escrow leaves");
+        if (wallet == asker) {
+            assertEq(imd.balanceOf(wallet) - walletBefore, escrow, "an owner who asked gets it all");
+        } else {
+            assertEq(imd.balanceOf(asker) - askerBefore, back, "the asker gets the price back");
+            assertEq(imd.balanceOf(wallet) - walletBefore, escrow - back, "the owner gets the rest");
+        }
+        (,, uint256 left, uint64 since) = pages.subjects(subject);
+        assertEq(left, 0);
+        assertEq(since, 0, "a settled escrow has no clock");
+        (address cleared,) = pages.settlements(subject);
+        assertEq(cleared, address(0), "the payout record is cleared");
+        _refused(actors[2], data, MarginaliaPages.NothingToSettle.selector); // never twice
+        ghostEscrow[subject] = 0;
+        ghostEscrowSince[subject] = 0;
+        ghostUnsettled[subject] = false;
+        ghostOut += escrow;
+        settlements++;
+    }
+
     function abandon(uint256 handleSeed) external {
         uint256 idx = handleSeed % handles.length;
         bytes32 subject = subjects[HANDLE_OFFSET + idx];
@@ -390,6 +448,7 @@ contract PagesHandler is Test {
         bytes memory data = abi.encodeCall(MarginaliaPages.recycle, (subject));
         uint256 escrow = ghostEscrow[subject];
         if (pages.payeeOf(subject) != address(0) || escrow == 0) {
+            // a claimed handle's frozen escrow is the owner's, never the pools'
             _refused(actors[2], data, MarginaliaPages.NothingToRecycle.selector);
             return;
         }
@@ -415,47 +474,70 @@ contract PagesHandler is Test {
         recycles++;
     }
 
+    /// @dev A burn tranche: a quiet buy of MARG bounded by the block's price budget. The pool takes what fits
+    /// under the bound, the rest stays queued; a block whose budget is spent refuses by name.
     function burn(uint256 amountSeed) external {
         uint256 pending = pages.pendingBurn();
-        if (pending < MIN_TRANCHE) {
-            // an empty queue is refused by the market; a dust queue (one tranche can leave a few wei behind)
-            // is refused inside the pool, which returns no MARG for it, and the wei stay queued for the next fee
+        if (pending == 0) {
             _refused(
                 actors[3],
-                abi.encodeCall(MarginaliaPages.burnPending, (1, 1)),
-                pending == 0
-                    ? MarginaliaPages.InsufficientBurn.selector
-                    : MarginaliaPages.UnauthorizedCallback.selector
+                abi.encodeCall(MarginaliaPages.burnPending, (1)),
+                MarginaliaPages.InsufficientBurn.selector
             );
             return;
         }
-        uint256 amount = bound(amountSeed, MIN_TRANCHE, pending);
         _refused(
             actors[3],
-            abi.encodeCall(MarginaliaPages.burnPending, (pending + 1, 1)),
+            abi.encodeCall(MarginaliaPages.burnPending, (pending + 1)),
             MarginaliaPages.InsufficientBurn.selector
         );
+        (uint160 limit, uint160 current, bool zeroForOne) = pages.burnLimit();
+        if (zeroForOne ? current <= limit : current >= limit) {
+            _refused(
+                actors[3],
+                abi.encodeCall(MarginaliaPages.burnPending, (pending)),
+                MarginaliaPages.BurnBudgetSpent.selector
+            );
+            assertEq(pages.pendingBurn(), pending, "a refused tranche stays queued");
+            budgetRefusals++;
+            return;
+        }
+        // one wei is eaten whole by the pool's LP fee: refused by name, and nothing is anchored by a refusal
+        uint64 anchorBlockBefore = pages.burnAnchorBlock();
         _refused(
             actors[3],
-            abi.encodeCall(MarginaliaPages.burnPending, (amount, 0)),
-            MarginaliaPages.Slippage.selector
+            abi.encodeCall(MarginaliaPages.burnPending, (1)),
+            MarginaliaPages.NothingBurned.selector
         );
-        // the pool sits near 1 MARG = 1 IMD with deep liquidity; 90% leaves room for the 1.25% LP fee and impact
-        uint256 floor = amount * 90 / 100;
-        if (floor == 0) floor = 1;
+        assertEq(pages.burnAnchorBlock(), anchorBlockBefore);
+        if (pending < MIN_TRANCHE) return;
+        uint256 amount = bound(amountSeed, MIN_TRANCHE, pending);
         uint256 deadBefore = marg.balanceOf(pages.DEAD());
         uint256 pagesBefore = imd.balanceOf(address(pages));
+        uint256 poolBefore = imd.balanceOf(manager);
+        uint256 poolMargBefore = marg.balanceOf(manager);
         vm.prank(actors[3]); // anyone
-        pages.burnPending(amount, floor);
-        uint256 burned = marg.balanceOf(pages.DEAD()) - deadBefore;
-        assertGe(burned, floor, "the floor holds");
-        assertEq(pagesBefore - imd.balanceOf(address(pages)), amount, "exactly the tranche is spent");
-        assertEq(pages.pendingBurn(), pending - amount);
-        ghostPendingBurn -= amount;
-        ghostOut += amount;
-        ghostImdBurned += amount;
+        (uint256 spent, uint256 burned) = pages.burnPending(amount);
+        assertGt(spent, 0, "something was spent");
+        assertLe(spent, amount, "never more than the tranche");
+        assertGt(burned, 0, "something was burned");
+        assertEq(marg.balanceOf(pages.DEAD()) - deadBefore, burned, "the MARG went to the dead address");
+        assertEq(poolMargBefore - marg.balanceOf(manager), burned, "and came out of the pool");
+        assertEq(pagesBefore - imd.balanceOf(address(pages)), spent, "exactly what the pool took left");
+        assertEq(imd.balanceOf(manager) - poolBefore, spent, "and the pool got it");
+        assertEq(pages.pendingBurn(), pending - spent, "the unspent rest stays queued");
+        assertEq(pages.burnAnchorBlock(), block.number, "the block is anchored");
+        (uint160 limitAfter, uint160 after_,) = pages.burnLimit();
+        assertEq(limitAfter, limit, "the bound holds for the whole block");
+        assertTrue(zeroForOne ? after_ >= limit : after_ <= limit, "the price never passes the bound");
+        if (spent < amount) {
+            assertEq(after_, limit, "a partial fill stops exactly at the bound");
+            partialFills++;
+        }
+        ghostPendingBurn -= spent;
+        ghostOut += spent;
+        ghostImdBurned += spent;
         ghostMargBurned += burned;
-        ghostMargFloor += floor;
         burns++;
     }
 
@@ -484,6 +566,10 @@ contract PagesInvariantTest is Fixture {
     function setUp() public {
         _setup();
         _fundCarol();
+        // Shallow in-range liquidity, the order of the live launch pool, so the per-block burn bound is hit
+        // within a run: tranches fill partially and a block's budget runs out.
+        liquidity.add(key, -6000, 6000, -10_000_000 ether);
+        liquidity.add(key, -6000, 6000, 2_000 ether);
         intake = new ClaimIntake();
         pages = new MarginaliaPages(IMarginaliaHookPages(address(hook)), intake, ACTION, vm.addr(SIGNER_KEY));
         address[4] memory actors = [alice, bob, carol, dave];
@@ -494,15 +580,16 @@ contract PagesInvariantTest is Fixture {
         handler = new PagesHandler(pages, intake, imd, IERC20(address(token)), SIGNER_KEY, actors, issuer);
         poolsBaseline = _claims(address(hook), address(imd));
         deadBaseline = token.balanceOf(pages.DEAD());
-        bytes4[] memory selectors = new bytes4[](8);
+        bytes4[] memory selectors = new bytes4[](9);
         selectors[0] = PagesHandler.buy.selector;
         selectors[1] = PagesHandler.sell.selector;
         selectors[2] = PagesHandler.requestClaim.selector;
         selectors[3] = PagesHandler.answer.selector;
-        selectors[4] = PagesHandler.abandon.selector;
-        selectors[5] = PagesHandler.recycle.selector;
-        selectors[6] = PagesHandler.burn.selector;
-        selectors[7] = PagesHandler.warp.selector;
+        selectors[4] = PagesHandler.settle.selector;
+        selectors[5] = PagesHandler.abandon.selector;
+        selectors[6] = PagesHandler.recycle.selector;
+        selectors[7] = PagesHandler.burn.selector;
+        selectors[8] = PagesHandler.warp.selector;
         targetContract(address(handler));
         targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
     }
@@ -511,7 +598,8 @@ contract PagesInvariantTest is Fixture {
         return handler.subjects(i);
     }
 
-    /// @dev What the market holds is exactly the curve reserves, the handle escrow and the burn queue.
+    /// @dev What the market holds is exactly the curve reserves, the handle escrow (frozen or not) and the
+    /// burn queue.
     function invariant_marketHoldsExactlyWhatItOwes() public view {
         uint256 owed = pages.pendingBurn();
         uint256 n = handler.subjectCount();
@@ -553,8 +641,9 @@ contract PagesInvariantTest is Fixture {
         }
     }
 
-    /// @dev Escrow, payee and the claim in flight match the ledger; a claim never reopens; a claimed subject is
-    /// paid directly, so its escrow stays empty.
+    /// @dev Escrow, payee, the claim in flight and the payout awaiting settlement match the ledger; a claim
+    /// never reopens; a claimed subject is paid directly, so its escrow is frozen at what the claim found
+    /// until it is settled, and then empty.
     function invariant_claimsAreFinal() public view {
         uint256 n = handler.subjectCount();
         for (uint256 i; i < n; ++i) {
@@ -566,16 +655,31 @@ contract PagesInvariantTest is Fixture {
             assertEq(claimant, handler.ghostClaimant(s));
             assertEq(price, handler.ghostPrice(s));
             assertEq(at, handler.ghostRequestedAt(s));
+            (address owedTo, uint96 owedBack) = pages.settlements(s);
             if (i < handler.HANDLE_OFFSET()) {
                 assertEq(storedPayee, address(0), "address subjects never store a payee");
                 address expected = s == bytes32(0) ? address(0) : address(uint160(uint256(s)));
                 assertEq(pages.payeeOf(s), expected);
+                assertEq(owedTo, address(0), "address subjects never settle");
+                assertEq(owedBack, 0);
             } else {
                 assertEq(storedPayee, handler.ghostPayee(s), "payee never changes once set");
                 assertEq(pages.payeeOf(s), handler.ghostPayee(s));
                 if (storedPayee != address(0)) {
-                    assertEq(escrow, 0, "a claimed handle is paid directly");
                     assertEq(pending, bytes32(0), "no claim can be pending on a claimed handle");
+                    if (handler.ghostUnsettled(s)) {
+                        assertEq(owedTo, handler.ghostSettleTo(s), "the payout waits for settlement");
+                        assertEq(owedBack, handler.ghostReimbursed(s));
+                        assertLe(owedBack, escrow, "the reimbursement never exceeds the escrow");
+                        assertLe(owedBack, pages.MAX_PRICE());
+                    } else {
+                        assertEq(escrow, 0, "a settled handle holds no escrow");
+                        assertEq(owedTo, address(0));
+                        assertEq(owedBack, 0);
+                    }
+                } else {
+                    assertEq(owedTo, address(0), "nothing to settle before a claim");
+                    assertEq(owedBack, 0);
                 }
             }
             if (escrow > 0) assertGt(since, 0, "escrow always has a clock");
@@ -587,12 +691,24 @@ contract PagesInvariantTest is Fixture {
     }
 
     /// @dev Fees reach where they are meant to: the pools' 5% (and recycled escrow) sit in the hook's IMD
-    /// claims; burned IMD became MARG at the dead address, never below the floors the callers set.
+    /// claims; every wei of burned IMD became MARG at the dead address.
     function invariant_feesReachPoolsAndDead() public view {
         assertEq(_claims(address(hook), address(imd)) - poolsBaseline, handler.ghostPools(), "pools funded");
         uint256 dead = token.balanceOf(pages.DEAD()) - deadBaseline;
         assertEq(dead, handler.ghostMargBurned(), "MARG at dead");
-        assertGe(dead, handler.ghostMargFloor(), "never below the floors");
         if (handler.ghostImdBurned() == 0) assertEq(dead, 0, "no burn without a tranche");
+        else assertGt(dead, 0, "no tranche without a burn");
+    }
+
+    /// @dev Nothing but burns trades on the pool here, so within a block the price never sits past the bound
+    /// measured from the block's anchor, and the bound is exactly BURN_SQRT_BPS of the anchor's sqrt price.
+    function invariant_burnsNeverPassTheBlocksBound() public view {
+        (uint160 limit, uint160 current, bool zeroForOne) = pages.burnLimit();
+        uint256 anchor = pages.burnAnchorBlock() == block.number ? pages.burnAnchorSqrtPrice() : current;
+        uint256 expected = zeroForOne
+            ? anchor * (10_000 - pages.BURN_SQRT_BPS()) / 10_000
+            : anchor * (10_000 + pages.BURN_SQRT_BPS()) / 10_000;
+        assertEq(limit, expected, "the limit is the anchor moved by the bound");
+        assertTrue(zeroForOne ? current >= limit : current <= limit, "the price is inside the bound");
     }
 }
