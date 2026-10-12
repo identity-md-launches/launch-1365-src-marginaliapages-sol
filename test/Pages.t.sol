@@ -104,9 +104,11 @@ contract PagesTest is Fixture {
         assertEq(pages.pendingBurn(), burn, "5% of the fee is reserved for burning");
         assertEq(token.balanceOf(pages.DEAD()), deadBefore, "trades do not depend on a swap");
         assertEq(imd.balanceOf(address(pages)), value + burn, "reserve plus segregated burn funds");
-        // At the fixture's 1:1 price this floor permits the pool's 1.25% LP fee and price impact.
-        pages.burnPending(burn, burn * 98 / 100);
-        assertGe(token.balanceOf(pages.DEAD()) - deadBefore, burn * 98 / 100);
+        // At the fixture's 1:1 price and depth the tranche fills whole, losing only the pool's 1.25% LP fee.
+        (uint256 spent, uint256 burned) = pages.burnPending(burn);
+        assertEq(spent, burn);
+        assertEq(token.balanceOf(pages.DEAD()) - deadBefore, burned);
+        assertGe(burned, burn * 98 / 100);
         assertEq(pages.pendingBurn(), 0);
         assertEq(imd.balanceOf(address(pages)), value, "a burn never spends the reserve");
     }
@@ -232,11 +234,22 @@ contract PagesTest is Fixture {
         bool ok = intake.deliver(address(pages), requestId, a, _sign(a));
         assertTrue(ok, "the callback fits the Intake's 200k stipend");
         assertEq(pages.payeeOf(subject), carol);
+        // the callback only verified and stored; anyone settles the payout in a later call
+        (address owedTo, uint256 reimbursed) = pages.settlements(subject);
+        assertEq(owedTo, carol);
+        assertEq(reimbursed, 0.5 ether);
+        assertEq(imd.balanceOf(carol), carolBefore - 0.5 ether, "nothing is paid inside the callback");
+        vm.prank(bob);
+        pages.settleClaim(subject);
         assertEq(
             imd.balanceOf(carol) - carolBefore,
             escrow - 0.5 ether,
             "the owner nets the escrow less the oracle price, which the escrow paid"
         );
+        (,, uint256 escrowLeft,) = pages.subjects(subject);
+        assertEq(escrowLeft, 0);
+        vm.expectRevert(MarginaliaPages.NothingToSettle.selector);
+        pages.settleClaim(subject);
         (rid,,,) = pages.claims(subject);
         assertEq(rid, bytes32(0), "the claim is closed");
         assertTrue(pages.consumed(a.requestId));
@@ -279,6 +292,7 @@ contract PagesTest is Fixture {
         a = _att(requestId, carol);
         assertTrue(intake.deliver(address(pages), requestId, a, _sign(a)));
         assertEq(pages.payeeOf(subject), carol);
+        pages.settleClaim(subject);
         assertEq(imd.balanceOf(bob), bobBefore, "the asker got the price back from the escrow");
         assertEq(
             imd.balanceOf(carol) - carolBefore, escrow - 0.5 ether, "the owner nets the escrow less the price"
@@ -297,6 +311,7 @@ contract PagesTest is Fixture {
         bytes32 requestId = pages.requestClaim("tiny", 7);
         OracleAttestation.Attestation memory a = _att(requestId, carol);
         assertTrue(intake.deliver(address(pages), requestId, a, _sign(a)));
+        pages.settleClaim(subject);
         assertEq(imd.balanceOf(carol), carolBefore - 0.5 ether + escrow);
     }
 

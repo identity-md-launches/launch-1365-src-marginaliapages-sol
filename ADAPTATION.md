@@ -20,6 +20,25 @@ Removed the existing root `launch.json`: it described the completed token/hook/p
 select the wrong deployment. No replacement was written; the manifest step owns it. `README.md`
 now describes this launch, its exact arguments, claim tweet format and burn operation.
 
+## Independent-review revision — 2026-10-12
+
+The accepted Pages launch was reopened on one medium finding; five advisory items came with it. Each
+was reproduced on the accepted tree before anything changed (`test/scratch`, not submitted). Only
+`src/MarginaliaPages.sol` changed in production code; the constructor, its four arguments and every
+economic constant are as before. `.imd-responses.json` answers every item by id.
+
+| Finding | Reproduced | Change in `src/MarginaliaPages.sol` | Regression |
+| --- | --- | --- | --- |
+| `b28cbca9` burn sandwich (medium) | Yes: at ~6k IMD depth, bob's push + `burnPending(601 IMD, 1)` + sell-back netted +49.65 / +78.76 / +102.29 / +126.62 IMD for 400 / 700 / 1000 / 1400 IMD pushes, exactly the reported figures; the MARG burned fell from 540 to 363. | The floor is now the chain's. `burnPending(imdIn)` (no caller floor) swaps with a `sqrtPriceLimitX96` set `BURN_SQRT_BPS` = 0.5% (about 1% in price) from the pool's sqrt price when the block's first burn began (`burnAnchorSqrtPrice` / `burnAnchorBlock`; `burnLimit()` exposes it). A tranche past the bound fills partially and only what the pool took leaves `pendingBurn`; a block whose budget is spent refuses with `BurnBudgetSpent`. The hook has no TWAP of the launch pool and the spot is what the attacker moves, so the bound is relative to the anchor the attacker may have pushed: that still caps what a sandwich can gain at ~1% of the attacker's position, below the 1.25% + 1.25% LP fees plus the hook's 3% quiet-sell fee the round trip pays. Every number of the brief is unchanged; the only new constant is the tolerance the finding asked for. | `test/PagesRevision.t.sol`: the reviewer's sandwich loses money at all four sizes; bounded tranches over successive blocks burn the whole 601 IMD budget and 540.077 MARG, the same as one unbounded swap; one block moves the price at most (1.005)². `test/PagesAudit.t.sol`: an oversized tranche fills up to the bound, is refused for the rest of the block and resumes next block; a burn after a 1,000,000-IMD push stays within the bound and cannot block trading. |
+| `0680ae89` recycle race (low) | Yes: dust escrow at t0, 100 pages at t0 + 91 days, `recycle` sweeps 46.359 IMD in the same block, the owner's claim then pays 0.5 IMD for nothing. | A share landing in escrow after the window has already elapsed restarts `escrowSince`; inside a window the first buy's clock stands, keeping the brief's "90 days after the first buy" for escrow that is being accumulated. | `test/PagesRevision.t.sol` `testAccrualAfterTheWindowOpensANewWindow...`: recycle refuses, the owner's claim takes the 45.9 IMD; an accrual inside a window does not restart it and recycling works at day 90. |
+| `f2228aa4` callback headroom (low) | Yes: the accepted callback made two transfers; 182,782 gas delivery (mock Intake overhead included) on the local token, 194,116 reported on the live one. | `onOracleResult` verifies and stores only: it sets the payee and records `settlements[subject]` (claimant, reimbursement; one slot). Permissionless `settleClaim(subject)` pays the escrow less the reimbursement; trades meanwhile pay the payee directly and the escrow is frozen (recycle refuses claimed subjects). `Claimed` is emitted by the callback, `ClaimSettled` by the settlement. | Delivery now measures 153,153 / 160,691 gas with the mock overhead (asserted < 160k in `testCallbackOnlyVerifiesAndStores...`); `test/Pages.t.sol` and `test/PagesOracle.t.sol` settle before checking balances and check nothing is paid inside the callback. |
+| `8a9e9350` self subjects (low) | Yes: `subjectOf(pages)` stranded 0.009 IMD per page bought; `subjectOf(hook)` paid the hook's raw balance. | `buy` refuses an address subject equal to this market or the hook with `BadSubject`. | `testMarketAndHookCannotBeSubjects`. |
+| `e209caca` dust tranche (info) | Yes: `burnPending(1 wei)` reverted `UnauthorizedCallback`. | A swap that returns no MARG reverts `NothingBurned`; the wei stay pending. | `testDustTrancheIsRefusedByName`. |
+| `8681a890` immutable oracle terms (info) | Not a defect; the brief orders no owner and the stored constants. | No code change. README now records the trust assumption and its consequences (claims stop; escrow recycles to the pools; ERC-1271 signer rotation remains possible). | — |
+
+The earlier `8ecf51b2` entry below (a caller-quoted floor) is superseded by the on-chain bound above.
+`test/fork/PagesMainnet.t.sol` follows the new signature and asserts the whole small tranche is spent.
+
 ## Imported audit findings and changes
 
 - **`1dcd97a5dd38` — reproduced.** The unchanged supplied claim-binding proof fails against the
@@ -101,6 +120,14 @@ All economic constants remain unchanged: BASE 0.1 IMD, 10% trade fee, 90/5/5 spl
 non-upgradeable. The live hook and other project contracts retain their behavior.
 
 ## Validation for this assignment
+
+Revision of 2026-10-12 (the independent-review round above): `forge build` passes with the unchanged
+configuration; `forge test --match-path 'test/Pages*.t.sol'` is **36 passed, 0 failed** (12 in
+`test/Pages.t.sol`, 10 audit, 6 oracle, 1 deployment, 7 revision); the full `forge test` is
+**287 passed, 0 failed, 2 skipped** (the two optional fork setups without an RPC). The reviewer's
+sandwich, rerun against the fixed code in scratch, loses 17.7 / 30.7 / 43.6 / 60.6 IMD for the four
+push sizes. Callback delivery with the mock Intake's overhead: 153,153 and 160,691 gas. The figures
+below are the earlier round's and are kept as its record.
 
 - Original Pages baseline: **12 passed**. Both unchanged supplied proofs failed on the original
   code and passed after the fixes. The isolated original-code truncation reproducer also passed,

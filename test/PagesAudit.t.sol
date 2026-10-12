@@ -138,12 +138,12 @@ contract PagesAuditTest is Fixture {
         uint256 dead = token.balanceOf(pages.DEAD());
         liquidity.add(key, -6000, 6000, -10_000_000 ether);
         vm.expectRevert();
-        pages.burnPending(burn, burn * 98 / 100);
+        pages.burnPending(burn);
         assertEq(pages.pendingBurn(), burn);
         assertEq(token.balanceOf(pages.DEAD()), dead);
         assertEq(imd.balanceOf(address(pages)), reserve + escrow + burn);
         liquidity.add(key, -6000, 6000, 10_000_000 ether);
-        pages.burnPending(burn, burn * 98 / 100);
+        pages.burnPending(burn);
         assertEq(pages.pendingBurn(), 0);
         assertGe(token.balanceOf(pages.DEAD()) - dead, burn * 98 / 100);
         assertEq(imd.balanceOf(address(pages)), reserve + escrow);
@@ -152,60 +152,78 @@ contract PagesAuditTest is Fixture {
         assertEq(escrowAfter, escrow);
     }
 
-    function testBurnUsesCallerFloorAndManipulatedPriceCannotBlockTrading() public {
+    function testBurnAfterAManipulatedPriceStaysBoundedAndCannotBlockTrading() public {
         bytes32 subject = pages.subjectOf(carol);
         _buyPages(subject, 1000);
         uint256 burn = pages.pendingBurn();
-        uint256 floor = burn * 98 / 100;
         uint256 snap = vm.snapshotState();
-        pages.burnPending(burn, floor); // The independently chosen floor is feasible before the front-run.
+        (uint256 spent, uint256 burned) = pages.burnPending(burn);
+        assertEq(spent, burn, "at the fixture's depth the whole tranche fits the block's bound");
+        assertGe(burned, burn * 98 / 100);
         vm.revertToState(snap);
-        _buy(bob, 1_000_000 ether);
+        _buy(bob, 1_000_000 ether); // MARG now costs far more than the anchor of a later block
         uint256 reserve = pages.reserveOf(subject);
         uint256 before = imd.balanceOf(address(pages));
-        vm.expectRevert(); // PoolManager wraps the callback's Slippage error.
-        pages.burnPending(burn, floor);
-        assertEq(pages.pendingBurn(), burn);
-        assertEq(imd.balanceOf(address(pages)), before);
+        (uint160 limit,, bool zeroForOne) = pages.burnLimit();
+        (spent, burned) = pages.burnPending(burn);
+        // The burn runs at the pushed price (there is no other MARG market) but moves it no further than
+        // the bound, and what it did not spend stays pending.
+        (, uint160 after_,) = pages.burnLimit();
+        assertTrue(zeroForOne ? after_ >= limit : after_ <= limit);
+        assertEq(pages.pendingBurn(), burn - spent);
+        assertEq(imd.balanceOf(address(pages)), before - spent);
         assertEq(pages.reserveOf(subject), reserve);
         _exit(subject, alice, 1000);
     }
 
-    function testPartialFillBurnRollsBackAndSmallerTranchesWork() public {
-        // Queue more IMD than this pool can absorb, without coupling the large page trade to a swap.
+    function testOversizedTrancheFillsUpToTheBlockBoundAndResumesNextBlock() public {
+        // Queue more IMD than one block's bound can absorb, without coupling the large page trade to a swap.
         bytes32 subject = pages.subjectOf(carol);
         (uint256 value, uint256 fee) = pages.buyPrice(subject, 200_000);
         imd.mint(alice, value + fee);
         _buyPages(subject, 200_000);
         uint256 burn = pages.pendingBurn();
         uint256 balance = imd.balanceOf(address(pages));
+        (uint160 limit, uint160 start, bool zeroForOne) = pages.burnLimit();
+        (uint256 spent,) = pages.burnPending(burn);
+        assertLt(spent, burn, "the tranche is cut where the price bound is reached");
+        assertGt(spent, 0);
+        (, uint160 current,) = pages.burnLimit();
+        assertEq(current, limit, "the pool stopped exactly at the block's limit");
+        assertEq(pages.burnAnchorSqrtPrice(), start);
+        assertEq(pages.burnAnchorBlock(), block.number);
+        assertEq(pages.pendingBurn(), burn - spent);
+        assertEq(imd.balanceOf(address(pages)), balance - spent);
+        // The block's budget is spent: a second burn in it is refused and nothing moves.
         vm.expectRevert();
-        pages.burnPending(burn, 1);
-        assertEq(pages.pendingBurn(), burn);
-        assertEq(imd.balanceOf(address(pages)), balance);
-        pages.burnPending(100 ether, 98 ether);
-        assertEq(pages.pendingBurn(), burn - 100 ether);
+        pages.burnPending(1 ether);
+        (uint160 limit2,,) = pages.burnLimit();
+        assertEq(limit2, limit, "the anchor holds for the rest of the block");
+        // Next block, the bound is measured from the new price and burning resumes.
+        vm.roll(block.number + 1);
+        (uint160 limit3,,) = pages.burnLimit();
+        assertTrue(zeroForOne ? limit3 < limit : limit3 > limit);
+        (uint256 spent2,) = pages.burnPending(pages.pendingBurn());
+        assertGt(spent2, 0);
         _exit(subject, alice, 200_000);
         assertEq(pages.reserveOf(subject), 0);
     }
 
-    function testBurnCannotSpendReserveOrEscrowAndRejectsZeroFloor() public {
+    function testBurnCannotSpendReserveOrEscrow() public {
         _buyPages(pages.subjectOfHandle("writer"), 20);
         uint256 burn = pages.pendingBurn();
         vm.expectRevert(MarginaliaPages.ZeroAmount.selector);
-        pages.burnPending(0, 1);
-        vm.expectRevert(MarginaliaPages.Slippage.selector);
-        pages.burnPending(burn, 0);
+        pages.burnPending(0);
         vm.expectRevert(MarginaliaPages.InsufficientBurn.selector);
-        pages.burnPending(burn + 1, 1);
+        pages.burnPending(burn + 1);
         vm.expectRevert(MarginaliaPages.UnauthorizedCallback.selector);
-        pages.unlockCallback(abi.encode(burn, 1));
+        pages.unlockCallback(abi.encode(burn));
         vm.prank(address(manager));
         vm.expectRevert(MarginaliaPages.UnauthorizedCallback.selector);
-        pages.unlockCallback(abi.encode(burn, 1));
-        pages.burnPending(burn, burn * 98 / 100);
+        pages.unlockCallback(abi.encode(burn));
+        pages.burnPending(burn);
         vm.expectRevert(MarginaliaPages.InsufficientBurn.selector);
-        pages.burnPending(1, 1);
+        pages.burnPending(1);
     }
 
     function testSupplyAndBalancesDoNotTruncateAboveUint64() public {

@@ -121,6 +121,8 @@ contract PagesOracleTest is Test {
         emit log_named_uint("delivery gas including mock Intake overhead", before - gasleft());
         assertTrue(ok, "200,000 gas callback stipend");
         assertEq(pages.payeeOf(subject), wallet);
+        assertEq(imd.balanceOf(asker), 0, "the callback verifies and stores; it pays nobody");
+        pages.settleClaim(subject);
         assertEq(imd.balanceOf(asker), 0.5 ether);
         assertEq(imd.balanceOf(wallet), 1.39 ether);
         assertTrue(pages.consumed(a.requestId));

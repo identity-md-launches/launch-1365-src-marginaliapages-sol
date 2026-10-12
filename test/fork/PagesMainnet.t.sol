@@ -47,10 +47,11 @@ contract PagesMainnetTest is Test {
         assertEq(HOOK.thesisPool(HOOK.week()) + HOOK.refundPool(HOOK.today()) - pools, 0.003 ether);
         uint256 burn = pages.pendingBurn();
         uint256 deadBefore = IERC20(HOOK.token()).balanceOf(pages.DEAD());
-        // Fork quote is fixed within this test; production callers should quote independently.
+        // A tranche this small sits far inside the per-block price bound, so it fills whole near spot.
         uint256 minMarg = burn * 1e18 / HOOK.margPriceInImd() * 98 / 100;
         assertGt(minMarg, 0);
-        pages.burnPending(burn, minMarg);
+        (uint256 spent,) = pages.burnPending(burn);
+        assertEq(spent, burn);
         assertGe(IERC20(HOOK.token()).balanceOf(pages.DEAD()) - deadBefore, minMarg);
         assertEq(IMD.balanceOf(address(pages)), 0.6 ether);
         vm.prank(trader);

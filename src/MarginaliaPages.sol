@@ -8,6 +8,8 @@ import {SwapParams} from "v4-core/src/types/PoolOperation.sol";
 import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
 import {Currency} from "v4-core/src/types/Currency.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
+import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
+import {PoolId, PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
@@ -27,7 +29,8 @@ interface IMarginaliaHookPages {
 /// is what their sealed notes and reasoning are delivered to first. Pages are bought and sold against a linear
 /// bonding curve in IMD with no cap (the n-th page costs BASE x n, so access is always open at the price demand
 /// sets), and they never transfer. Every trade pays a 10% fee: 90% of it to the issuer in IMD, 5% buys MARG on
-/// the launch pool and burns it via permissionless bounded tranches, 5% goes to the hook's pools.
+/// the launch pool and burns it via permissionless tranches whose price impact is bounded on chain, 5% goes to
+/// the hook's pools.
 ///
 /// An issuer is any address, or an X handle nobody has claimed yet: pages of a handle are bought against the same
 /// curve while the issuer's share waits in escrow. The handle's owner claims it WITHOUT any party of ours: they
@@ -38,6 +41,8 @@ interface IMarginaliaHookPages {
 /// No owner, no pause, no upgrade, no attester.
 contract MarginaliaPages is IUnlockCallback, ReentrancyGuard, OracleAttestationConsumer {
     using SafeERC20 for IERC20;
+    using StateLibrary for IPoolManager;
+    using PoolIdLibrary for PoolKey;
 
     /// @dev price of the n-th page = BASE * n; no cap.
     uint256 public constant BASE = 0.1 ether; // IMD
@@ -47,6 +52,11 @@ contract MarginaliaPages is IUnlockCallback, ReentrancyGuard, OracleAttestationC
     // the remaining 500 bps of the fee go to the hook's pools
     uint256 public constant CLAIM_WINDOW = 90 days;
     address public constant DEAD = 0x000000000000000000000000000000000000dEaD;
+    /// @dev Burns may move the pool's sqrt price by at most 0.5% (about 1% in price) per block, measured from
+    /// the price the block's first burn found. A sandwich of the burn gains at most that 1% on the attacker's
+    /// position while their round trip pays the pool's LP fee twice plus the hook's quiet-sell fee, so the
+    /// burn budget cannot be converted into an attacker's profit; a tranche past the bound fills partially.
+    uint256 public constant BURN_SQRT_BPS = 50;
 
     /// @dev The oracle terms, the Judge's: a panel of five, four must agree, at most 1 IMD a question, and an
     /// unanswered request may be abandoned and retried after three days.
@@ -83,8 +93,22 @@ contract MarginaliaPages is IUnlockCallback, ReentrancyGuard, OracleAttestationC
     mapping(bytes32 => uint256) public reserveOf;
     mapping(bytes32 => Claim) public claims;
     mapping(bytes32 => bytes32) private subjectOfRequest;
+
+    /// @dev A successful claim's payout, stored by the callback and paid by settleClaim: the asker owed the
+    /// oracle price from the escrow, and how much (at most MAX_PRICE, so one slot). The escrow itself stays in
+    /// Subject.escrow until settled.
+    struct Settlement {
+        address claimant;
+        uint96 reimbursed;
+    }
+
+    mapping(bytes32 => Settlement) public settlements;
     /// @notice IMD reserved exclusively for MARG burns, separate from curve reserves and handle escrow.
     uint256 public pendingBurn;
+    /// @dev The pool's sqrt price when this block's first burn began: the reference every burn in the block is
+    /// bounded against.
+    uint160 public burnAnchorSqrtPrice;
+    uint64 public burnAnchorBlock;
 
     error ZeroAmount();
     error InsufficientPages();
@@ -101,6 +125,10 @@ contract MarginaliaPages is IUnlockCallback, ReentrancyGuard, OracleAttestationC
     error UnknownRequest();
     error BadAnswer();
     error InsufficientBurn();
+    error BadSubject();
+    error NothingToSettle();
+    error BurnBudgetSpent();
+    error NothingBurned();
 
     event Trade(
         bytes32 indexed subject,
@@ -117,6 +145,9 @@ contract MarginaliaPages is IUnlockCallback, ReentrancyGuard, OracleAttestationC
     event ClaimFailed(bytes32 indexed subject, bytes32 indexed requestId);
     event ClaimAbandoned(bytes32 indexed subject, bytes32 indexed requestId);
     event Claimed(bytes32 indexed subject, address indexed wallet, uint256 escrowPaid, uint256 reimbursed);
+    event ClaimSettled(
+        bytes32 indexed subject, address indexed wallet, uint256 escrowPaid, uint256 reimbursed
+    );
     event Recycled(bytes32 indexed subject, uint256 amount);
     event Burned(uint256 imdSpent, uint256 margBurned);
     event BurnQueued(uint256 imdAmount);
@@ -195,6 +226,11 @@ contract MarginaliaPages is IUnlockCallback, ReentrancyGuard, OracleAttestationC
     /// @notice Buy pages of a subject, paying `value + fee` IMD, at most `maxCost`.
     function buy(bytes32 subject, uint256 amount, uint256 maxCost) external nonReentrant {
         if (amount == 0) revert ZeroAmount();
+        // This market and the hook cannot be issuers: their share would be paid to a balance nothing accounts for.
+        if (uint256(subject) >> 160 == 0) {
+            address issuer = address(uint160(uint256(subject)));
+            if (issuer == address(this) || issuer == address(hook)) revert BadSubject();
+        }
         Subject storage s = subjects[subject];
         (uint256 value, uint256 fee) = buyPrice(subject, amount);
         if (value + fee > maxCost) revert Slippage();
@@ -232,7 +268,11 @@ contract MarginaliaPages is IUnlockCallback, ReentrancyGuard, OracleAttestationC
         if (payee != address(0)) {
             IERC20(imd).safeTransfer(payee, toIssuer);
         } else {
-            if (s.escrowSince == 0) s.escrowSince = uint64(block.timestamp);
+            // The window runs from the first buy of the escrow being accumulated: a share landing after the
+            // window has already elapsed opens a new one, so no accrual is recyclable the moment it lands.
+            if (s.escrowSince == 0 || block.timestamp >= uint256(s.escrowSince) + CLAIM_WINDOW) {
+                s.escrowSince = uint64(block.timestamp);
+            }
             s.escrow += toIssuer;
         }
         if (toBurn > 0) {
@@ -322,6 +362,9 @@ contract MarginaliaPages is IUnlockCallback, ReentrancyGuard, OracleAttestationC
 
     /// @notice The Intake delivers the panel's answer here. A real address becomes the payee and takes the
     /// escrow, less the oracle price reimbursed to whoever asked; zero is a failed claim, retriable at once.
+    /// @dev The Intake attempts this callback once, with a 200,000-gas stipend, so it only verifies and stores:
+    /// the payout is recorded here and paid by settleClaim, which anyone may call. Trades after this point pay
+    /// the payee directly.
     function onOracleResult(
         bytes32 requestId,
         OracleAttestation.Attestation calldata a,
@@ -350,13 +393,28 @@ contract MarginaliaPages is IUnlockCallback, ReentrancyGuard, OracleAttestationC
         if (s.payee != address(0)) revert AlreadyClaimed();
         s.payee = wallet;
         uint256 owed = s.escrow;
-        s.escrow = 0;
         uint256 reimbursed = owed >= c.price ? c.price : 0;
-        owed -= reimbursed;
+        settlements[subject] = Settlement(c.claimant, uint96(reimbursed));
+        emit Claimed(subject, wallet, owed - reimbursed, reimbursed);
+    }
+
+    /// @notice Pays out a successful claim: the escrow to the payee, less the oracle price reimbursed to whoever
+    /// asked. Anyone may call it, once per claim; the escrow cannot change in between, since a claimed subject's
+    /// trades pay the payee directly and recycling refuses a claimed subject.
+    function settleClaim(bytes32 subject) external nonReentrant {
+        Subject storage s = subjects[subject];
+        address wallet = s.payee;
+        Settlement memory p = settlements[subject];
+        uint256 owed = s.escrow;
+        if (wallet == address(0) || (owed == 0 && p.reimbursed == 0)) revert NothingToSettle();
+        s.escrow = 0;
+        s.escrowSince = 0;
+        delete settlements[subject];
+        owed -= p.reimbursed;
         IERC20 imd = IERC20(hook.imd());
-        if (reimbursed > 0) imd.safeTransfer(c.claimant, reimbursed);
+        if (p.reimbursed > 0) imd.safeTransfer(p.claimant, p.reimbursed);
         if (owed > 0) imd.safeTransfer(wallet, owed);
-        emit Claimed(subject, wallet, owed, reimbursed);
+        emit ClaimSettled(subject, wallet, owed, p.reimbursed);
     }
 
     /// @notice Anyone clears a claim the panel never answered once its deadline has passed, so the subject can
@@ -387,45 +445,66 @@ contract MarginaliaPages is IUnlockCallback, ReentrancyGuard, OracleAttestationC
 
     // ------------------------------------------------------------------ MARG burn
 
-    /// @notice Anyone may burn a tranche of the accumulated fee IMD, with an explicit minimum MARG output.
-    /// @dev The caller chooses a meaningful floor from an independent quote. A failed/partial swap leaves
-    /// the pending balance intact and never blocks page trades. No reserve or escrow may fund this call.
-    function burnPending(uint256 imdIn, uint256 minMargOut) external nonReentrant {
+    /// @notice Anyone may burn up to `imdIn` of the accumulated fee IMD: a quiet buy of MARG on the launch pool
+    /// sent straight to DEAD. The floor is the chain's, not the caller's: the buy stops where the pool's sqrt
+    /// price has moved BURN_SQRT_BPS from this block's anchor (see burnLimit), and whatever it did not spend
+    /// stays pending for a later block. Never blocks page trades; no reserve or escrow may fund this call.
+    /// @return spent the IMD the pool took, `burned` the MARG sent to DEAD.
+    function burnPending(uint256 imdIn) external nonReentrant returns (uint256 spent, uint256 burned) {
         if (imdIn == 0) revert ZeroAmount();
         if (imdIn > pendingBurn || imdIn > uint256(uint128(type(int128).max))) revert InsufficientBurn();
-        if (minMargOut == 0) revert Slippage();
-        pendingBurn -= imdIn;
-        hook.poolManager().unlock(abi.encode(imdIn, minMargOut));
+        (spent, burned) = abi.decode(hook.poolManager().unlock(abi.encode(imdIn)), (uint256, uint256));
+        pendingBurn -= spent;
+        emit Burned(spent, burned);
+    }
+
+    /// @notice The sqrt price limit a burn in this block may push the pool to, and the current sqrt price.
+    /// The anchor is the price the block's first burn found (or the current one if none has run yet).
+    function burnLimit() public view returns (uint160 limit, uint160 current, bool zeroForOne) {
+        IPoolManager manager = hook.poolManager();
+        PoolKey memory key = hook.getPoolKey();
+        zeroForOne = Currency.unwrap(key.currency0) == hook.imd(); // IMD in, MARG out
+        (current,,,) = manager.getSlot0(key.toId());
+        uint256 anchor = burnAnchorBlock == block.number ? burnAnchorSqrtPrice : current;
+        limit = _limitFrom(anchor, zeroForOne);
+    }
+
+    function _limitFrom(uint256 anchor, bool zeroForOne) private pure returns (uint160) {
+        if (zeroForOne) {
+            uint256 l = anchor * (10_000 - BURN_SQRT_BPS) / 10_000;
+            return l > TickMath.MIN_SQRT_PRICE ? uint160(l) : TickMath.MIN_SQRT_PRICE + 1;
+        }
+        uint256 u = anchor * (10_000 + BURN_SQRT_BPS) / 10_000;
+        return u < TickMath.MAX_SQRT_PRICE ? uint160(u) : TickMath.MAX_SQRT_PRICE - 1;
     }
 
     function unlockCallback(bytes calldata data) external returns (bytes memory) {
         IPoolManager manager = hook.poolManager();
         if (msg.sender != address(manager) || !_reentrancyGuardEntered()) revert UnauthorizedCallback();
-        (uint256 imdIn, uint256 minMargOut) = abi.decode(data, (uint256, uint256));
+        uint256 imdIn = abi.decode(data, (uint256));
         PoolKey memory key = hook.getPoolKey();
         address imd = hook.imd();
         bool zeroForOne = Currency.unwrap(key.currency0) == imd; // IMD in, MARG out
-        BalanceDelta d = manager.swap(
-            key,
-            SwapParams(
-                zeroForOne,
-                -int256(imdIn),
-                zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
-            ),
-            ""
-        );
+        (uint160 current,,,) = manager.getSlot0(key.toId());
+        if (burnAnchorBlock != block.number) {
+            burnAnchorBlock = uint64(block.number);
+            burnAnchorSqrtPrice = current;
+        }
+        uint160 limit = _limitFrom(burnAnchorSqrtPrice, zeroForOne);
+        if (zeroForOne ? current <= limit : current >= limit) revert BurnBudgetSpent();
+        BalanceDelta d = manager.swap(key, SwapParams(zeroForOne, -int256(imdIn), limit), "");
         int128 inD = zeroForOne ? d.amount0() : d.amount1();
         int128 outD = zeroForOne ? d.amount1() : d.amount0();
-        if (inD >= 0 || outD <= 0 || uint256(-int256(inD)) != imdIn) revert UnauthorizedCallback();
+        if (inD >= 0 || uint256(-int256(inD)) > imdIn) revert UnauthorizedCallback();
+        if (outD <= 0) revert NothingBurned();
+        uint256 spent = uint256(-int256(inD));
         uint256 marg = uint256(uint128(outD));
-        if (marg < minMargOut) revert Slippage();
         Currency pay = zeroForOne ? key.currency0 : key.currency1;
         Currency recv = zeroForOne ? key.currency1 : key.currency0;
         manager.sync(pay);
-        IERC20(imd).safeTransfer(address(manager), imdIn);
+        IERC20(imd).safeTransfer(address(manager), spent);
         manager.settle();
         manager.take(recv, DEAD, marg);
-        emit Burned(imdIn, marg);
-        return "";
+        return abi.encode(spent, marg);
     }
 }

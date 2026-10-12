@@ -23,7 +23,7 @@ No owner, no pause, no upgrade. Spec: `SPEC.md`.
 | `MarginaliaRouter` | The only path that can attach a note; optionally trades X on Uniswap v4, v3 or v2 in the same transaction so the position is proven, and refuses a note about a token other than the one traded. Plain MARG buys and sells go through any v4 router. |
 | `MarginaliaJudge` | The oracle consumer: once a week buys the panel's ranking of the week's long-form theses through the IMD Intake, verifies the EIP-712 attestation, tells the hook whom to pay. Short-form calls are never judged. |
 | `MarginaliaTreasury` | Receives prizes and gifts in IMD; drips 2% of its IMD into the pools daily. No withdraw; refuses ETH. |
-| `MarginaliaPages` | The page market (this launch): pages of an author on a linear IMD curve (0.1 IMD × n, no cap, never transferable); 10% fee per trade, 90% of it to the issuer, 5% is reserved for permissionless MARG burns with an explicit output floor, 5% to the pools; pages of an unclaimed X handle escrow the issuer share until the owner claims it through the IdentityMD oracle: they tweet the exact claim statement naming this market, chain and wallet, anyone pays the Intake's price to verify it (X's public embed JSON, no login), and the signed answer sets the payee, the price reimbursed from the escrow. No attester, no server of ours. Unclaimed escrow recycles into the pools after 90 days. Page holders get sealed notes first. |
+| `MarginaliaPages` | The page market (this launch): pages of an author on a linear IMD curve (0.1 IMD × n, no cap, never transferable); 10% fee per trade, 90% of it to the issuer, 5% is reserved for permissionless MARG burns whose price impact is bounded on chain per block, 5% to the pools; pages of an unclaimed X handle escrow the issuer share until the owner claims it through the IdentityMD oracle: they tweet the exact claim statement naming this market, chain and wallet, anyone pays the Intake's price to verify it (X's public embed JSON, no login), and the signed answer sets the payee, the price reimbursed from the escrow. No attester, no server of ours. Unclaimed escrow recycles into the pools after 90 days. Page holders get sealed notes first. |
 | `MarginaliaPricer` | Stateless, ownerless helper the hook calls by staticcall (kept out of the hook for code size): score arithmetic (log2, sqrt, difficulty), price reads and the settlement rule: a prior-window baseline (v3/v2 accumulator TWAP, conservative v4/hub extreme); observation reads (v3 tick cumulative, v2 price cumulative, v4 spot, the ETH→IMD hub spot); settle price = TWAP first→last on v3/v2, the observation least favourable to the call on v4 and on the hub leg. An honest observation pins the extreme; the series must span at least one hour. |
 
 ## Deployed (Ethereum mainnet, 2026-10-11)
@@ -129,14 +129,35 @@ path. The Intake routes answers; the oracle UUID is distinct from the Intake req
 question window prevents precomputing `questionHash`.
 
 Every page trade still allocates 90% of its 10% fee to the issuer (or escrow), 5% to `pendingBurn`, and
-5% immediately through `hook.fundPot` (70% thesis / 30% refund). A caller executes
-`burnPending(imdIn, minMargOut)` for any tranche no larger than the accumulated burn balance. Use a
-meaningful minimum from an independent quote; zero is refused. The quiet buy pays the pool's LP fee,
-no hook fee, and sends all MARG directly to the fixed dead address. Failed swaps, insufficient liquidity,
-partial fills and missed output floors leave the tranche available for retry. They cannot block buying
-or selling pages. Burning requires a caller and available pool liquidity; the caller chooses the price
-floor, so this is not a protocol-wide fair-price oracle or a guarantee against malicious low-floor burns.
-Curve reserves and handle escrow cannot fund burns. The supply getter now returns `uint256`.
+5% immediately through `hook.fundPot` (70% thesis / 30% refund). Anyone executes `burnPending(imdIn)`
+for any tranche no larger than the accumulated burn balance; it returns what was spent and burned. The
+floor is the chain's, not the caller's: within one block the burns may move the pool's sqrt price by at
+most `BURN_SQRT_BPS` (0.5%, about 1% in price) from the price the block's first burn found (`burnLimit()`
+shows the limit). A tranche that reaches the bound fills partially and the rest stays pending for a later
+block; a block whose budget is spent refuses with `BurnBudgetSpent`, and a tranche the pool's fee rounds
+to nothing with `NothingBurned`. A sandwich of the burn therefore gains at most ~1% on the attacker's
+position while the round trip pays the pool's 1.25% LP fee twice plus the hook's 3% quiet-sell fee, so
+the burn budget cannot be turned into an attacker's profit, and a burn cannot be used as a free lever on
+MARG's spot price. At the live pool's depth one block absorbs roughly 30 IMD of burn, so a large budget
+drains over a few minutes of blocks; the total MARG burned equals what one unbounded swap would have
+bought. The quiet buy pays the pool's LP fee, no hook fee, and sends all MARG directly to the fixed dead
+address. Failed swaps and missing liquidity leave the tranche available for retry and cannot block
+buying or selling pages. Curve reserves and handle escrow cannot fund burns. The supply getter returns
+`uint256`.
+
+The claim callback only verifies and stores (the Intake attempts it once, with a 200,000-gas stipend):
+it records the payee and the asker's reimbursement, and anyone then calls `settleClaim(subject)` to pay
+the escrow to the payee less the oracle price to the asker. Trades in between pay the payee directly;
+the escrow is frozen until settled. An issuer share landing in escrow after the 90-day window has
+already elapsed opens a new window, so a fresh accrual is never recyclable the moment it lands; inside a
+window the first buy's clock stands. This market and the hook are refused as address subjects.
+
+Trust assumption: the Intake, action and oracle signer are immutable, as the brief orders (no owner).
+If the oracle signer key rotates, the action's price leaves (0, 1 IMD], or Intake v1 stops answering,
+handle claims stop working (deliveries fail or are abandoned after 3 days, the asker's price lost) and
+unclaimed handle escrow recycles to the hook's pools after 90 days instead of reaching the authors.
+Address subjects, page holders and curve exits are unaffected. The signer may be an ERC-1271 contract
+the oracle operator rotates behind, which the attestation check already supports.
 
 The focused suite is `forge test --match-path 'test/Pages*.t.sol'`. An optional integration rehearsal is
 `MAINNET_RPC_URL=http://127.0.0.1:36699/rpc/1 forge test --match-path test/fork/PagesMainnet.t.sol` on the
