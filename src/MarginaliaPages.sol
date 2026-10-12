@@ -52,10 +52,12 @@ contract MarginaliaPages is IUnlockCallback, ReentrancyGuard, OracleAttestationC
     // the remaining 500 bps of the fee go to the hook's pools
     uint256 public constant CLAIM_WINDOW = 90 days;
     address public constant DEAD = 0x000000000000000000000000000000000000dEaD;
-    /// @dev Burns may move the pool's sqrt price by at most 0.5% (about 1% in price) per block, measured from
-    /// the price the block's first burn found. A sandwich of the burn gains at most that 1% on the attacker's
-    /// position while their round trip pays the pool's LP fee twice plus the hook's quiet-sell fee, so the
-    /// burn budget cannot be converted into an attacker's profit; a tranche past the bound fills partially.
+    /// @dev A block burns once, and that one tranche may move the pool's sqrt price by at most 0.5% (about 1%
+    /// in price) from the price it finds; a tranche past the bound fills partially and the rest waits for a
+    /// later block. The bound therefore caps the block's volume as well as its price level: bringing the
+    /// price back under the limit (selling MARG back between tranches) re-opens nothing, so a sandwich
+    /// gains at most that 1% on the attacker's position while their round trip pays the pool's LP fee
+    /// twice plus the hook's quiet-sell fee.
     uint256 public constant BURN_SQRT_BPS = 50;
 
     /// @dev The oracle terms, the Judge's: a panel of five, four must agree, at most 1 IMD a question, and an
@@ -105,8 +107,8 @@ contract MarginaliaPages is IUnlockCallback, ReentrancyGuard, OracleAttestationC
     mapping(bytes32 => Settlement) public settlements;
     /// @notice IMD reserved exclusively for MARG burns, separate from curve reserves and handle escrow.
     uint256 public pendingBurn;
-    /// @dev The pool's sqrt price when this block's first burn began: the reference every burn in the block is
-    /// bounded against.
+    /// @dev The pool's sqrt price when this block's burn began, and the block: the reference its tranche was
+    /// bounded against. A block whose burn has run refuses another, whatever the price has since become.
     uint160 public burnAnchorSqrtPrice;
     uint64 public burnAnchorBlock;
 
@@ -446,9 +448,11 @@ contract MarginaliaPages is IUnlockCallback, ReentrancyGuard, OracleAttestationC
     // ------------------------------------------------------------------ MARG burn
 
     /// @notice Anyone may burn up to `imdIn` of the accumulated fee IMD: a quiet buy of MARG on the launch pool
-    /// sent straight to DEAD. The floor is the chain's, not the caller's: the buy stops where the pool's sqrt
-    /// price has moved BURN_SQRT_BPS from this block's anchor (see burnLimit), and whatever it did not spend
-    /// stays pending for a later block. Never blocks page trades; no reserve or escrow may fund this call.
+    /// sent straight to DEAD. The floor is the chain's, not the caller's: a block burns once, the buy stops
+    /// where the pool's sqrt price has moved BURN_SQRT_BPS from the price it found (see burnLimit), and
+    /// whatever it did not spend stays pending for a later block. A second burn in the same block is refused
+    /// with BurnBudgetSpent even if the price has come back. Never blocks page trades; no reserve or escrow
+    /// may fund this call.
     /// @return spent the IMD the pool took, `burned` the MARG sent to DEAD.
     function burnPending(uint256 imdIn) external nonReentrant returns (uint256 spent, uint256 burned) {
         if (imdIn == 0) revert ZeroAmount();
@@ -459,7 +463,8 @@ contract MarginaliaPages is IUnlockCallback, ReentrancyGuard, OracleAttestationC
     }
 
     /// @notice The sqrt price limit a burn in this block may push the pool to, and the current sqrt price.
-    /// The anchor is the price the block's first burn found (or the current one if none has run yet).
+    /// The anchor is the price the block's burn found (or the current one if none has run yet); once a
+    /// block has burned, burnPending refuses for the rest of it whatever these read.
     function burnLimit() public view returns (uint160 limit, uint160 current, bool zeroForOne) {
         IPoolManager manager = hook.poolManager();
         PoolKey memory key = hook.getPoolKey();
@@ -486,11 +491,12 @@ contract MarginaliaPages is IUnlockCallback, ReentrancyGuard, OracleAttestationC
         address imd = hook.imd();
         bool zeroForOne = Currency.unwrap(key.currency0) == imd; // IMD in, MARG out
         (uint160 current,,,) = manager.getSlot0(key.toId());
-        if (burnAnchorBlock != block.number) {
-            burnAnchorBlock = uint64(block.number);
-            burnAnchorSqrtPrice = current;
-        }
-        uint160 limit = _limitFrom(burnAnchorSqrtPrice, zeroForOne);
+        // One tranche per block: the bound must cap the block's volume, not only the level the price may
+        // reach, or selling MARG back between tranches would re-open it (a burn / sell / burn sandwich).
+        if (burnAnchorBlock == block.number) revert BurnBudgetSpent();
+        burnAnchorBlock = uint64(block.number);
+        burnAnchorSqrtPrice = current;
+        uint160 limit = _limitFrom(current, zeroForOne);
         if (zeroForOne ? current <= limit : current >= limit) revert BurnBudgetSpent();
         BalanceDelta d = manager.swap(key, SwapParams(zeroForOne, -int256(imdIn), limit), "");
         int128 inD = zeroForOne ? d.amount0() : d.amount1();

@@ -131,16 +131,25 @@ question window prevents precomputing `questionHash`.
 Every page trade still allocates 90% of its 10% fee to the issuer (or escrow), 5% to `pendingBurn`, and
 5% immediately through `hook.fundPot` (70% thesis / 30% refund). Anyone executes `burnPending(imdIn)`
 for any tranche no larger than the accumulated burn balance; it returns what was spent and burned. The
-floor is the chain's, not the caller's: within one block the burns may move the pool's sqrt price by at
-most `BURN_SQRT_BPS` (0.5%, about 1% in price) from the price the block's first burn found (`burnLimit()`
-shows the limit). A tranche that reaches the bound fills partially and the rest stays pending for a later
-block; a block whose budget is spent refuses with `BurnBudgetSpent`, and a tranche the pool's fee rounds
-to nothing with `NothingBurned`. A sandwich of the burn therefore gains at most ~1% on the attacker's
-position while the round trip pays the pool's 1.25% LP fee twice plus the hook's 3% quiet-sell fee, so
-the burn budget cannot be turned into an attacker's profit, and a burn cannot be used as a free lever on
-MARG's spot price. At the live pool's depth one block absorbs roughly 30 IMD of burn, so a large budget
-drains over a few minutes of blocks; the total MARG burned equals what one unbounded swap would have
-bought. The quiet buy pays the pool's LP fee, no hook fee, and sends all MARG directly to the fixed dead
+floor is the chain's, not the caller's: a block burns once, and that tranche may move the pool's sqrt
+price by at most `BURN_SQRT_BPS` (0.5%, about 1% in price) from the price it found (`burnLimit()` shows
+the limit). A tranche that reaches the bound fills partially and the rest stays pending for a later block;
+any further burn in that block is refused with `BurnBudgetSpent`, even if the price has since come back
+under the limit (otherwise selling MARG back between tranches would re-open the bound and let one
+transaction burn the whole budget at a pushed price), and a tranche the pool's fee rounds to nothing is
+refused with `NothingBurned`. The bound therefore caps a block's burn volume as well as its price level: a
+sandwich of the burn gains at most ~1% on the attacker's position while the round trip pays the pool's
+1.25% LP fee twice plus the hook's 3% quiet-sell fee, so pushing the price and trading back against the
+pool's resting liquidity loses money at every size, and a burn cannot be used as a free lever on MARG's
+spot price. What the bound does not do is price the burn against anything but the pool: the one price
+reference on chain is the launch pool's spot, so a block's tranche is bought at the price that block
+finds, and someone who first pushes that price and then supplies the MARG the tranche buys as in-range
+liquidity at the pushed price captures, at most, the slippage their own push paid against the pool's
+resting depth, less the LP fee of the push; at the live depth (about 6,000 IMD in range) that needs a push
+of more than roughly 75 IMD to break even and is bounded by the tranche size, which the per-block bound
+holds to about 30 IMD. At the live pool's depth one block absorbs roughly 30 IMD of burn, so a large
+budget drains over a few minutes of blocks; the total MARG burned equals what one unbounded swap would
+have bought. The quiet buy pays the pool's LP fee, no hook fee, and sends all MARG directly to the fixed dead
 address. Failed swaps and missing liquidity leave the tranche available for retry and cannot block
 buying or selling pages. Curve reserves and handle escrow cannot fund burns. The supply getter returns
 `uint256`.
@@ -150,7 +159,13 @@ it records the payee and the asker's reimbursement, and anyone then calls `settl
 the escrow to the payee less the oracle price to the asker. Trades in between pay the payee directly;
 the escrow is frozen until settled. An issuer share landing in escrow after the 90-day window has
 already elapsed opens a new window, so a fresh accrual is never recyclable the moment it lands; inside a
-window the first buy's clock stands. This market and the hook are refused as address subjects.
+window the first buy's clock stands. The restarted window carries the whole escrow with it, including
+shares accrued 90 or more days earlier: a handle that keeps trading at or after day 90 (a buy ordered
+before a recycle in the same block, repeated every 90 days) defers the recycling of its entire escrow,
+indefinitely if the trades keep coming. This is the deliberate trade-off of one clock per subject: the
+deferred escrow stays claimable by the handle's owner and nobody is paid wrongly, whoever defers it pays
+trade fees of which 90% land in that same escrow, and only the hook pools' recycled income is delayed.
+This market and the hook are refused as address subjects.
 
 Trust assumption: the Intake, action and oracle signer are immutable, as the brief orders (no owner).
 If the oracle signer key rotates, the action's price leaves (0, 1 IMD], or Intake v1 stops answering,

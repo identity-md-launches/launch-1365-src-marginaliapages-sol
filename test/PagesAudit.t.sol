@@ -194,8 +194,8 @@ contract PagesAuditTest is Fixture {
         assertEq(pages.burnAnchorBlock(), block.number);
         assertEq(pages.pendingBurn(), burn - spent);
         assertEq(imd.balanceOf(address(pages)), balance - spent);
-        // The block's budget is spent: a second burn in it is refused and nothing moves.
-        vm.expectRevert();
+        // The block's budget is spent: a second burn in it is refused by name and nothing moves.
+        vm.expectRevert(MarginaliaPages.BurnBudgetSpent.selector);
         pages.burnPending(1 ether);
         (uint160 limit2,,) = pages.burnLimit();
         assertEq(limit2, limit, "the anchor holds for the rest of the block");

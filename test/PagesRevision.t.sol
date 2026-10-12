@@ -61,14 +61,89 @@ contract PagesRevisionTest is Fixture {
         return abi.encodePacked(r, s, v);
     }
 
-    /// @dev Burn everything pending within the current block: tranches until the block's bound refuses.
+    /// @dev Burn what this block allows: one tranche of everything pending, cut at the block's bound.
     function _burnThisBlock() internal returns (uint256 burned) {
+        if (pages.pendingBurn() == 0) return 0;
+        (, burned) = pages.burnPending(pages.pendingBurn());
+    }
+
+    /// @dev The second reviewer's sandwich: push the price, then burn a tranche, sell back exactly the MARG it
+    /// burned so the price is under the limit again, burn again, ... until nothing is pending, then sell the
+    /// rest. Returns the attacker's net IMD, the MARG burned and how many tranches the block accepted.
+    function _cycleSandwich(uint256 push)
+        internal
+        returns (int256 gain, uint256 burned, uint256 tranches, bytes4 refusal)
+    {
+        uint256 bobBefore = imd.balanceOf(bob);
+        uint256 held = _buy(bob, push);
         for (uint256 i; i < 50 && pages.pendingBurn() > 0; ++i) {
-            (uint160 limit, uint160 current, bool z) = pages.burnLimit();
-            if (z ? current <= limit : current >= limit) break;
-            (, uint256 b) = pages.burnPending(pages.pendingBurn());
+            (bool ok, bytes memory ret) =
+                address(pages).call(abi.encodeCall(pages.burnPending, (pages.pendingBurn())));
+            if (!ok) {
+                refusal = bytes4(ret);
+                break;
+            }
+            (, uint256 b) = abi.decode(ret, (uint256, uint256));
             burned += b;
+            ++tranches;
+            uint256 back = b > held ? held : b;
+            _sell(bob, back);
+            held -= back;
         }
+        if (held > 0) _sell(bob, held);
+        gain = int256(imd.balanceOf(bob)) - int256(bobBefore);
+    }
+
+    /// @dev Finding 19412c9f: with the bound only on the price level, selling back between tranches drained the
+    /// whole 601 IMD budget in one block for +37 / +66 / +97 / +128 IMD at these push sizes. A block now burns
+    /// once: the loop gets one tranche, the second burn is refused by name although the price is back under
+    /// the limit, most of the budget stays pending, and the attacker's round trip loses money at every size.
+    function testBurnSellBurnSandwichIsRefusedAndLosesMoneyAtEverySize() public {
+        bytes32 subject = pages.subjectOf(carol);
+        vm.prank(alice);
+        pages.buy(subject, 1550, type(uint256).max);
+        uint256 pending = pages.pendingBurn();
+        assertEq(pending, 601.0125 ether);
+        uint256[4] memory sizes = [uint256(700 ether), 1000 ether, 1400 ether, 2000 ether];
+        for (uint256 i; i < sizes.length; ++i) {
+            uint256 snap = vm.snapshotState();
+            (int256 gain, uint256 burned, uint256 tranches, bytes4 refusal) = _cycleSandwich(sizes[i]);
+            assertLt(gain, 0, "the sandwich loses after LP and hook fees");
+            assertEq(tranches, 1, "a block burns once");
+            assertEq(refusal, MarginaliaPages.BurnBudgetSpent.selector, "the second burn is refused by name");
+            assertGt(burned, 0);
+            assertGt(pages.pendingBurn(), pending * 9 / 10, "almost all of the budget waits for later blocks");
+            vm.revertToState(snap);
+        }
+    }
+
+    /// @dev The refusal is per block, not per price level: after a tranche reaches the bound and a sale brings
+    /// the price back under the limit, the block still refuses; the next block burns again from its own anchor.
+    function testASecondBurnInABlockIsRefusedEvenAfterThePriceCameBack() public {
+        bytes32 subject = pages.subjectOf(carol);
+        vm.prank(alice);
+        pages.buy(subject, 1550, type(uint256).max);
+        (uint256 spent, uint256 burned) = pages.burnPending(pages.pendingBurn());
+        assertGt(pages.pendingBurn(), 0, "the tranche was cut at the bound");
+        (uint160 limit, uint160 current, bool z) = pages.burnLimit();
+        assertEq(current, limit);
+        _sell(bob, burned); // bob holds MARG from the fixture: the price is under the limit again
+        (limit, current, z) = pages.burnLimit();
+        assertTrue(z ? current > limit : current < limit, "the price came back under the limit");
+        uint256 pending = pages.pendingBurn();
+        vm.expectRevert(MarginaliaPages.BurnBudgetSpent.selector);
+        pages.burnPending(pending);
+        vm.expectRevert(MarginaliaPages.BurnBudgetSpent.selector);
+        pages.burnPending(1 ether);
+        assertEq(pages.pendingBurn(), pending);
+        assertEq(pages.burnAnchorBlock(), block.number);
+        vm.roll(block.number + 1);
+        (uint256 spent2, uint256 burned2) = pages.burnPending(pending);
+        assertGt(spent2, 0);
+        assertGt(burned2, 0);
+        assertEq(pages.burnAnchorBlock(), block.number);
+        assertEq(pages.pendingBurn(), pending - spent2);
+        assertGt(spent, 0);
     }
 
     // ------------------------------------------------------------------ the burn's on-chain floor

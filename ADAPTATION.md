@@ -20,6 +20,22 @@ Removed the existing root `launch.json`: it described the completed token/hook/p
 select the wrong deployment. No replacement was written; the manifest step owns it. `README.md`
 now describes this launch, its exact arguments, claim tweet format and burn operation.
 
+## Second independent-review revision — 2026-10-12
+
+Reopened on one medium finding against the previous round's burn bound, with one advisory item. Both were
+reproduced on the accepted tree before anything changed (`test/scratch`, not submitted). Only
+`src/MarginaliaPages.sol` changed in production code; the constructor, its four arguments and every
+economic constant (including `BURN_SQRT_BPS`) are as before. `.imd-responses.json` answers both by id.
+
+| Finding | Reproduced | Change in `src/MarginaliaPages.sol` | Regression |
+| --- | --- | --- | --- |
+| `19412c9f` burn / sell / burn sandwich (medium) | Yes, to the reviewer's figures: with the bound only comparing the current price with the block's limit, bob's push + {burn tranche, sell back exactly the MARG it burned} loop + final sale drained the whole 601.0125 IMD budget in one block (17 to 20 tranches) for +37.44 / +66.43 / +96.61 / +127.94 IMD at pushes of 700 / 1000 / 1400 / 2000 IMD, burning 474.6 / 435.2 / 389.9 / 334.1 MARG instead of 540.1. | A block burns once. `unlockCallback` refuses with `BurnBudgetSpent` when `burnAnchorBlock` is already this block, before reading the limit; otherwise it records the anchor and bounds the one tranche at `BURN_SQRT_BPS` from the price it found, as before. The bound now caps the block's volume, not only the level the price may reach: bringing the price back under the limit re-opens nothing. The stale `current` vs `limit` check is kept as a guard at the price extremes. NatSpec and README no longer claim an absolute guarantee; they state what the bound does (the sandwich against the pool's resting liquidity loses at every size) and what it does not (the reference is the pool's spot; a pusher who also supplies the tranche's MARG as liquidity at the pushed price captures at most the slippage their push paid, bounded by the ~30 IMD a block's tranche is at the live depth). | `test/PagesRevision.t.sol` `testBurnSellBurnSandwichIsRefusedAndLosesMoneyAtEverySize`: the reviewer's loop at the four push sizes gets exactly one tranche, the second burn reverts `BurnBudgetSpent`, more than 90% of the budget stays pending and bob ends down 30.71 / 43.59 / 60.57 / 85.65 IMD; `testASecondBurnInABlockIsRefusedEvenAfterThePriceCameBack`: after a tranche reaches the bound and a sale brings the price back under the limit, both a full and a 1 IMD burn are refused, the anchor holds, and the next block burns again. `test/PagesAudit.t.sol` `testOversizedTranche...` now expects the named error. The existing across-blocks test still burns the whole budget and 540.077 MARG, one tranche per block. |
+| `681b03fb` window restart carries the older escrow (info) | Yes: dust escrow at t0, 1 page bought at t0 + 90 days in the block before `recycle`, which then reverts `TooEarly`; repeated every 90 days it defers recycling indefinitely while the owner can still claim everything. | No code change: this is the trade-off of the single clock per subject the previous round chose over the recycle race (`0680ae89`), and the finding offers stating it as a resolution. `README.md` now says the restarted window carries the whole escrow, that trades at or after day 90 can defer recycling indefinitely, and why that is accepted (the escrow stays claimable by the owner, nobody is paid wrongly, the deferring party's fees land 90% in that escrow, only the pools' recycled income is delayed). Separate clocks per accrual would need a second escrow bucket in the subject, the claim settlement and the recycle path for an income delay with no victim. | Behaviour unchanged; `testAccrualAfterTheWindowOpensANewWindow...` still covers the restart. |
+
+Validation of this round: `forge build` passes (warnings only); `forge test` passes every test (the fork suite
+skips without `MAINNET_RPC_URL`); the reviewer's loop rebuilt in `test/scratch/BurnBoundCycle.t.sol` failed on
+the accepted tree with the figures above and passes now.
+
 ## Independent-review revision — 2026-10-12
 
 The accepted Pages launch was reopened on one medium finding; five advisory items came with it. Each
