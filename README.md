@@ -7,7 +7,7 @@ no leverage, no counterparty and no payout for being right: a right call only ge
 one forfeits it to the writers' pools. The only money that moves is the author's own. Key holders read an
 author's sealed notes before the crowd does; nobody trades against anyone.
 
-This launch deploys the fixed-supply Marginalia token and its Uniswap v4 hook on Ethereum mainnet. The hook clones the live launch-1240 Router, Judge and Treasury and calls the live Pricer; none of those implementations is redeployed. Buying MARG through the
+This contracts-only launch deploys **MarginaliaPages only** on Ethereum mainnet, using the existing launch-1283 hook. The token, hook, pool and companion implementations are already live. The hook clones the live launch-1240 Router, Judge and Treasury and calls the live Pricer; none of those implementations is redeployed. Buying MARG through the
 router with a note attached posts a falsifiable call on an ERC-20 other than IMD itself, backed by a flat 0.1 IMD stamp and an
 IMD bond the author sizes between 0.25 and 10 IMD (every note also buys 0.25 IMD of MARG). Calls resolve against a manipulation-resistant settlement price built from permissionless
 on-chain observations (v3/v2 TWAPs, the adverse extreme on v4); right calls get their deposit back,
@@ -23,7 +23,7 @@ No owner, no pause, no upgrade. Spec: `SPEC.md`.
 | `MarginaliaRouter` | The only path that can attach a note; optionally trades X on Uniswap v4, v3 or v2 in the same transaction so the position is proven, and refuses a note about a token other than the one traded. Plain MARG buys and sells go through any v4 router. |
 | `MarginaliaJudge` | The oracle consumer: once a week buys the panel's ranking of the week's long-form theses through the IMD Intake, verifies the EIP-712 attestation, tells the hook whom to pay. Short-form calls are never judged. |
 | `MarginaliaTreasury` | Receives prizes and gifts in IMD; drips 2% of its IMD into the pools daily. No withdraw; refuses ETH. |
-| `MarginaliaPages` | The page market (next launch, after the hook): pages of an author on a linear IMD curve (0.1 IMD × n, no cap, never transferable); 10% fee per trade, 90% of it to the issuer, 5% buys and burns MARG, 5% to the pools; keys of an unclaimed X handle escrow the issuer share until the owner claims it through the IdentityMD oracle: they tweet their wallet, anyone pays the Intake's price to ask the panel which address the handle's tweet names (X's public embed JSON, no login), and the signed answer sets the payee, the price reimbursed from the escrow. No attester, no server of ours. Unclaimed escrow recycles into the pools after 90 days. Page holders get sealed notes first. |
+| `MarginaliaPages` | The page market (this launch): pages of an author on a linear IMD curve (0.1 IMD × n, no cap, never transferable); 10% fee per trade, 90% of it to the issuer, 5% is reserved for permissionless MARG burns with an explicit output floor, 5% to the pools; pages of an unclaimed X handle escrow the issuer share until the owner claims it through the IdentityMD oracle: they tweet the exact claim statement naming this market, chain and wallet, anyone pays the Intake's price to verify it (X's public embed JSON, no login), and the signed answer sets the payee, the price reimbursed from the escrow. No attester, no server of ours. Unclaimed escrow recycles into the pools after 90 days. Page holders get sealed notes first. |
 | `MarginaliaPricer` | Stateless, ownerless helper the hook calls by staticcall (kept out of the hook for code size): score arithmetic (log2, sqrt, difficulty), price reads and the settlement rule: a prior-window baseline (v3/v2 accumulator TWAP, conservative v4/hub extreme); observation reads (v3 tick cumulative, v2 price cumulative, v4 spot, the ETH→IMD hub spot); settle price = TWAP first→last on v3/v2, the observation least favourable to the call on v4 and on the hub leg. An honest observation pins the extreme; the series must span at least one hour. |
 
 ## Deployed (Ethereum mainnet, 2026-10-11)
@@ -73,7 +73,7 @@ The per-author cap limits one wallet's occupancy; it is not Sybil resistance.
    by the hook) plus the stateless `MarginaliaPricer` `0xEaff9B262341A0cB05579227e662BFE768A71cfb`. The on-chain
    runtime bytecode matches this tree's build (the judge differs only in its EIP-712 immutables).
 2. ✅ The four addresses are pinned in `src/MarginaliaImpls.sol`.
-3. Hook launch (`launch.json`, kind `univ4_hook`): the factory deploys the token and the hook; the hook's constructor
+3. ✅ Hook launch **#1283** (historical `univ4_hook` launch): the factory deploys the token and the hook; the hook's constructor
    clones the three implementations and initialises each with itself in the same transaction. The constructor is
    chain-state-free (the launcher rehearses constructors in an empty EVM): it reads no code at any address, and a
    codeless companion would revert on first use because every companion call expects return data.
@@ -103,9 +103,44 @@ MAINNET_RPC_URL=https://... forge test --match-path test/fork/MainnetLaunch.t.so
 
 ## Launch
 
-The implementations are live (launch #1240, above). The hook launch deploys `MarginaliaHook` with
-`$poolManager, $token, $factory`, the `Marginalia` token, and the MARG/IMD pool at LP fee 12500; its `launch.json`
-is written by the launch's manifest step. See `ADAPTATION.md` for the reproduced findings, changes and validation.
+Deploy only `src/MarginaliaPages.sol:MarginaliaPages`, with the four constructor arguments below, in order.
+The constructor makes no external calls and assigns no owner. The next launch step writes `launch.json`;
+the old hook-launch manifest has been removed. See `ADAPTATION.md` for findings and validation.
+
+| Argument | Value |
+|---|---|
+| hook | `0xf0457dd0cf526686190e4f057ba19db14d34a0cc` |
+| intake | `0x1397434cd35e8a9C8aC312A61D3A285EB31dea56` |
+| action | `0x6f7261636c652e72657175657374406f7261636c652d31000000000000000000` |
+| signer | `0x5598Aa9146215Bc13eb26f2c692Ad1461Fd32982` |
+
+An X handle owner must publish exactly this text, replacing both bracketed values with the actual addresses
+and using the market address in lowercase (no brackets in the tweet):
+
+```text
+I claim Marginalia pages on chain 1 at <deployed Pages address> for wallet <owner wallet>.
+```
+
+The final period is part of the statement. `questionBody(normalizedHandle, tweetId)` gives the full
+verification rule for the deployed market. Ordinary token-address tweets, claims for another market/chain,
+and extra text are refused by that rule. Anyone may call `requestClaim`; only the authenticated oracle
+answer delivered by the Intake sets the permanent payee. The paid request has a three-day abandonment
+path. The Intake routes answers; the oracle UUID is distinct from the Intake request id, and the relative
+question window prevents precomputing `questionHash`.
+
+Every page trade still allocates 90% of its 10% fee to the issuer (or escrow), 5% to `pendingBurn`, and
+5% immediately through `hook.fundPot` (70% thesis / 30% refund). A caller executes
+`burnPending(imdIn, minMargOut)` for any tranche no larger than the accumulated burn balance. Use a
+meaningful minimum from an independent quote; zero is refused. The quiet buy pays the pool's LP fee,
+no hook fee, and sends all MARG directly to the fixed dead address. Failed swaps, insufficient liquidity,
+partial fills and missed output floors leave the tranche available for retry. They cannot block buying
+or selling pages. Burning requires a caller and available pool liquidity; the caller chooses the price
+floor, so this is not a protocol-wide fair-price oracle or a guarantee against malicious low-floor burns.
+Curve reserves and handle escrow cannot fund burns. The supply getter now returns `uint256`.
+
+The focused suite is `forge test --match-path 'test/Pages*.t.sol'`. An optional integration rehearsal is
+`MAINNET_RPC_URL=http://127.0.0.1:36699/rpc/1 forge test --match-path test/fork/PagesMainnet.t.sol` on the
+contributor machine. It deploys only on a local fork and spends no live funds. Offline runs skip it.
 
 Sealed notes: `seal(x, venue, hash)` commits to a note before it is posted. The seal pays one stamp up front
 (non-refundable, so a seal is never a free option), prices the venue's BUY and SELL baselines at that moment, and

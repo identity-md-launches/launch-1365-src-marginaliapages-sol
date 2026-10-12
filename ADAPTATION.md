@@ -1,3 +1,140 @@
+# MarginaliaPages launch adaptation — 2026-10-12
+
+This assignment deploys **one contract**, `src/MarginaliaPages.sol:MarginaliaPages`, on Ethereum
+(chain id 1). All earlier entries below describe historical launches. No hook, token, pool, companion,
+owner role, proxy or initializer is added or redeployed. Only Pages production code changed.
+Build configuration and dependencies are untouched; no dependency was installed.
+
+## Factory handoff
+
+The existing nonpayable constructor already has the required `(address,address,bytes32,address)` ABI,
+performs no external call, and is unchanged. Arguments, in order:
+
+1. Hook: `0xf0457dd0cf526686190e4f057ba19db14d34a0cc`.
+2. Intake: `0x1397434cd35e8a9C8aC312A61D3A285EB31dea56`.
+3. Action: `0x6f7261636c652e72657175657374406f7261636c652d31000000000000000000`
+   (`bytes32("oracle.request@oracle-1")`, not a hash).
+4. Signer: `0x5598Aa9146215Bc13eb26f2c692Ad1461Fd32982`.
+
+Removed the existing root `launch.json`: it described the completed token/hook/pool launch and would
+select the wrong deployment. No replacement was written; the manifest step owns it. `README.md`
+now describes this launch, its exact arguments, claim tweet format and burn operation.
+
+## Imported audit findings and changes
+
+- **`1dcd97a5dd38` — reproduced.** The unchanged supplied claim-binding proof fails against the
+  original question. `questionBody` in `src/MarginaliaPages.sol` now requires the tweet's entire
+  text to be the deliberate claim statement naming this market address, this chain, and a single
+  recipient wallet. It returns that wallet rather than the market address; unrelated address
+  tweets and extra text require zero. The old `bddnewstoday` token-address probe is therefore not
+  an acceptable claim. `test/PagesAudit.t.sol` checks the instruction itself (not just consumer
+  metadata), JSON validity, body limits, normalized handle, source guard and deployment/chain
+  binding. Unit tests verify the question supplied to the panel, not off-chain panel reasoning.
+
+- **`5bf6cd36fb4e` — reproduced.** Withdrawing all fixture liquidity makes the original supplied
+  sell-out proof revert through the hook's `PartialFill`. `_distributeFee` now adds the unchanged
+  burn share to `pendingBurn` instead of swapping during a trade. The separate nonReentrant
+  `burnPending(imdIn,minMargOut)` executes permissionless tranches and cannot spend reserves or
+  escrow. A revert rolls back its pending-balance debit. `test/PagesAudit.t.sol` tests multiple
+  holders exiting with no liquidity, buys in that state, pool restoration and retry, partial-fill
+  refusal, smaller successful tranches, and complete large exits. Pool funding remains immediate
+  through the live hook's `fundPot`, which settles claims without requiring swap liquidity.
+
+- **`8ecf51b296b80` — output loss reproduced; the stated profit did not reproduce.** The original
+  fixture burns 247.115768228801323318 MARG for a 1,000-page buy. Preceding it with the stated
+  1,000,000-IMD buy reduces the burn to 204.693308948730789744 MARG. The searcher's specified
+  round trip loses 52,993.877966197089670555 IMD after LP/hook fees, so that example is not a
+  profitable sandwich. The missing minimum was real. The audit's deferred, caller-quoted burn
+  option is implemented: each burn requires a nonzero minimum output and a whole input fill,
+  with all MARG sent directly to DEAD. Tests show a floor feasible before the price move rejects
+  the manipulated output without consuming the pending tranche, while a page holder still exits.
+  This is caller-selected execution protection, not a global fair-price guarantee: a malicious
+  permissionless caller can choose a low floor. No new price feed, authority or slippage constant
+  is introduced. Meaningful independent quotes and burn execution are caller responsibilities.
+
+- **`550f1f4d8493` — reproduced as isolated arithmetic, not a feasible live-token exploit.** With
+  a mintable IMD and inert pool swap / fee sink, the original credits `2**64` pages but reports
+  supply zero. The initial attempt to bypass only PoolManager failed the hook's unlock-context
+  check; the independent arithmetic fixture isolates both external limits. `Subject.supply`
+  is now `uint256`, and buy/sell no longer narrow the amount. This preserves the no-cap rule
+  instead of imposing a new uint64 ceiling. `test/PagesAudit.t.sol` buys and sells above `2**64`
+  with an accounting-only fee sink, and fuzzes real-pool reserve/holder/escrow/burn accounting.
+  The `subjects` getter's first return type changes from uint64 to uint256; Pages is not deployed
+  yet, and there is no existing Pages storage to migrate. Ordinary arithmetic overflow and
+  external token/pool representational limits still revert atomically.
+
+- **`8af79412047b` — not an exploit against an honest Intake; no protocol change.** The supplied
+  oracle reference explicitly states that the callback's Intake id and attestation UUID differ,
+  and that the relative window prevents precomputing `questionHash`. Requiring equal ids would
+  break live delivery. The Intake remains trusted to pair the signed answer with the request
+  purchased by Pages. `test/PagesOracle.t.sol` verifies distinct ids, UUID replay refusal across
+  pending requests, refusal of unsolicited ids, and signatures for another consumer. No claim
+  is made that these checks protect against a malicious trusted Intake misrouting a valid answer.
+
+- **`053844bddb7b` — informational, no defect.** Rechecked the live hook and Intake through the
+  contributor endpoint `http://127.0.0.1:36699/rpc/1`: IMD, MARG, PoolManager, INTAKE, ACTION,
+  ORACLE_SIGNER, initialization and pool key match the brief. `priceOf` is 0.5 IMD, below the
+  unchanged 1 IMD ceiling. `test/fork/PagesMainnet.t.sol` rehearses Pages against those live
+  dependencies on a local fork; it skips without `MAINNET_RPC_URL`. No live transaction is sent.
+
+## Other changes required by the brief
+
+- `src/MarginaliaPages.sol`: `abandonClaim` now also uses `nonReentrant`, matching the requirement
+  for claims. A reentering fee sink test in `test/PagesAudit.t.sol` confirms cancellation cannot
+  occur during a trade, then succeeds normally outside it. `unlockCallback` still accepts only
+  the hook's PoolManager and now also requires an active guarded operation. Burn input is
+  bounded by v4's signed delta range, and output is checked before settlement. The flow remains
+  `sync → transfer from Pages' own funds → settle`, then `take(MARG, DEAD, output)`.
+- `test/Pages.t.sol`: retains all 12 scenarios; the original immediate-burn assertion now checks
+  fee reservation and an explicit bounded burn, and supply variables follow the uint256 getter.
+- `test/PagesDeployment.t.sol`: CREATE2 deployment with the exact four live arguments on an
+  empty chain, constructor ABI/configuration, runtime size, constants and forbidden-opcode scan.
+- `test/PagesOracle.t.sol`: the protocol's unchanged digest/signature/selector vector plus a
+  fresh address answer under the 200,000-gas stipend, with distinct zero-balance reimbursement
+  and payee recipients. Also tests request routing, domain binding, replay and abandonment.
+  `src/OracleAttestation.sol` is unchanged: its existing memory SignatureChecker entry point is
+  compatible with the vendored OpenZeppelin version and the canonical vector.
+
+All economic constants remain unchanged: BASE 0.1 IMD, 10% trade fee, 90/5/5 split of that fee,
+70/30 split inside `fundPot`, 5-member/4-quorum oracle, MAX_PRICE 1 IMD, three-day abandonment,
+90-day recycling, and the fixed dead address. Pages remain nontransferable, ownerless and
+non-upgradeable. The live hook and other project contracts retain their behavior.
+
+## Validation for this assignment
+
+- Original Pages baseline: **12 passed**. Both unchanged supplied proofs failed on the original
+  code and passed after the fixes. The isolated original-code truncation reproducer also passed,
+  confirming the bad state described above. Scratch reproducers are not part of the submission.
+- `forge build`: **passed**, using the existing Solidity 0.8.26 / Cancun / via-IR / optimizer-200
+  configuration. Compiler and lint warnings remain in pre-existing project code; no build errors.
+- `forge test --match-path 'test/Pages*.t.sol'`: **29 passed, 0 failed**, including all 12 original
+  Pages scenarios and the new 256-case accounting fuzz test.
+- Final plain `forge test`, after retiring scratch-only reproducers: **278 passed, 0 failed,
+  2 skipped**. The skipped entries are the two optional fork suite setups with no RPC environment.
+  The preceding full run including the three scratch proofs was 281 passed, 0 failed, 2 skipped.
+- The **unchanged supplied `Contracts.protected.t.sol`** passed against Pages' compiled creation
+  bytecode and exact four constructor arguments on empty chain id 1. It rehearsed factory CREATE2
+  deployment, address prediction, the EIP-170 bound and the forbidden-opcode scan. Its artifacts
+  were isolated in scratch; no build configuration file changed.
+- `MAINNET_RPC_URL=http://127.0.0.1:36699/rpc/1 forge test --match-path test/fork/PagesMainnet.t.sol`
+  (with separate scratch output/cache paths): **2 passed**. This exercised live dependency
+  constants, page buy/sell, fee distribution, MARG burn and Intake payment on a local mainnet fork.
+- Pages runtime: **15,834 bytes**; creation bytecode: **17,280 bytes**, or **17,408** with the four
+  ABI-encoded arguments. No unresolved library links. No forbidden escape opcodes.
+- The fresh-recipient callback completed under the mock Intake's **200,000-gas stipend**;
+  the trace records **155,416 gas** for the callback frame. The broader test wrapper's 203,394-gas
+  measurement includes Intake/encoding/storage overhead outside that frame. The original local
+  hook/Intake callback tests pass as well.
+- `git diff --check` passed; protected configuration/dependency paths have no diff.
+- No Slither, Mythril, paid off-chain oracle panel, explorer verification or mainnet broadcast
+  was performed. No network is needed for the delivered unit tests; optional fork tests skip.
+
+The prior launch results following this section are historical and are not claims about this assignment.
+
+---
+
+# Historical adaptation records
+
 # Independent-review revision — 2026-10-11
 
 This is a revision of the accepted hook launch, not a new implementation. The only executable

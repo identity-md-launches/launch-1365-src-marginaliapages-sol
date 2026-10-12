@@ -37,10 +37,12 @@ contract ClaimIntake is IIntake {
         lastRequestId = requestId;
     }
 
-    function deliver(address target, bytes32 requestId, OracleAttestation.Attestation calldata a, bytes calldata sig)
-        external
-        returns (bool ok)
-    {
+    function deliver(
+        address target,
+        bytes32 requestId,
+        OracleAttestation.Attestation calldata a,
+        bytes calldata sig
+    ) external returns (bool ok) {
         (ok,) = target.call{gas: 200_000}(abi.encodeCall(MarginaliaPages.onOracleResult, (requestId, a, sig)));
     }
 }
@@ -82,7 +84,7 @@ contract PagesTest is Fixture {
         assertEq(pages.priceOf(0, 200), 0.1 ether * 200 * 201 / 2); // two hundred pages
     }
 
-    function testBuyPaysTheIssuerBurnsMargAndFundsThePools() public {
+    function testBuyPaysTheIssuerQueuesBoundedBurnAndFundsThePools() public {
         bytes32 subject = pages.subjectOf(carol);
         (uint256 value, uint256 fee) = pages.buyPrice(subject, 3);
         assertEq(value, 0.6 ether);
@@ -98,8 +100,15 @@ contract PagesTest is Fixture {
         assertEq(pages.reserveOf(subject), value, "the curve reserve holds the value, never the fee");
         assertEq(imd.balanceOf(carol) - carolBefore, fee * 9000 / 10_000, "90% of the fee to the issuer");
         assertEq(_pools() - poolsBefore, fee * 500 / 10_000, "5% of the fee to the pools");
-        assertGt(token.balanceOf(pages.DEAD()) - deadBefore, 0, "5% of the fee bought MARG and burned it");
-        assertEq(imd.balanceOf(address(pages)), value, "the contract holds exactly the reserve");
+        uint256 burn = fee * 500 / 10_000;
+        assertEq(pages.pendingBurn(), burn, "5% of the fee is reserved for burning");
+        assertEq(token.balanceOf(pages.DEAD()), deadBefore, "trades do not depend on a swap");
+        assertEq(imd.balanceOf(address(pages)), value + burn, "reserve plus segregated burn funds");
+        // At the fixture's 1:1 price this floor permits the pool's 1.25% LP fee and price impact.
+        pages.burnPending(burn, burn * 98 / 100);
+        assertGe(token.balanceOf(pages.DEAD()) - deadBefore, burn * 98 / 100);
+        assertEq(pages.pendingBurn(), 0);
+        assertEq(imd.balanceOf(address(pages)), value, "a burn never spends the reserve");
     }
 
     function testSellReturnsTheCurveLessFeeAndPagesAreNotTransferable() public {
@@ -115,7 +124,7 @@ contract PagesTest is Fixture {
         pages.sell(subject, 2, value - fee);
         assertEq(imd.balanceOf(alice) - before, value - fee);
         assertEq(pages.pagesOf(subject, alice), 3);
-        (uint64 supply,,,) = pages.subjects(subject);
+        (uint256 supply,,,) = pages.subjects(subject);
         assertEq(supply, 5);
         vm.prank(bob);
         vm.expectRevert(MarginaliaPages.InsufficientPages.selector);
@@ -159,7 +168,11 @@ contract PagesTest is Fixture {
         pages.subjectOfHandle("no spaces");
     }
 
-    function _att(bytes32 requestId, address wallet) internal view returns (OracleAttestation.Attestation memory a) {
+    function _att(bytes32 requestId, address wallet)
+        internal
+        view
+        returns (OracleAttestation.Attestation memory a)
+    {
         a.requestId = requestId;
         a.chainId = block.chainid;
         a.questionHash = keccak256("question");
@@ -188,7 +201,7 @@ contract PagesTest is Fixture {
         assertEq(pages.payeeOf(subject), address(0));
         vm.prank(alice);
         pages.buy(subject, 20, type(uint256).max); // 21 IMD of pages → 2.1 fee → 1.89 escrow, above the oracle price
-        (uint64 supply, address payee, uint256 escrow, uint64 since) = pages.subjects(subject);
+        (uint256 supply, address payee, uint256 escrow, uint64 since) = pages.subjects(subject);
         assertEq(supply, 20);
         assertEq(payee, address(0));
         assertEq(escrow, pages.priceOf(0, 20) * 1000 / 10_000 * 9000 / 10_000);
@@ -219,7 +232,11 @@ contract PagesTest is Fixture {
         bool ok = intake.deliver(address(pages), requestId, a, _sign(a));
         assertTrue(ok, "the callback fits the Intake's 200k stipend");
         assertEq(pages.payeeOf(subject), carol);
-        assertEq(imd.balanceOf(carol) - carolBefore, escrow - 0.5 ether, "the owner nets the escrow less the oracle price, which the escrow paid");
+        assertEq(
+            imd.balanceOf(carol) - carolBefore,
+            escrow - 0.5 ether,
+            "the owner nets the escrow less the oracle price, which the escrow paid"
+        );
         (rid,,,) = pages.claims(subject);
         assertEq(rid, bytes32(0), "the claim is closed");
         assertTrue(pages.consumed(a.requestId));
@@ -263,7 +280,9 @@ contract PagesTest is Fixture {
         assertTrue(intake.deliver(address(pages), requestId, a, _sign(a)));
         assertEq(pages.payeeOf(subject), carol);
         assertEq(imd.balanceOf(bob), bobBefore, "the asker got the price back from the escrow");
-        assertEq(imd.balanceOf(carol) - carolBefore, escrow - 0.5 ether, "the owner nets the escrow less the price");
+        assertEq(
+            imd.balanceOf(carol) - carolBefore, escrow - 0.5 ether, "the owner nets the escrow less the price"
+        );
     }
 
     /// @dev Tiny escrow: the price is not reimbursed and the owner gets what is there.
