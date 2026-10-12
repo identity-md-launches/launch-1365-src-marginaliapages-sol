@@ -651,12 +651,15 @@ contract PagesEdgesTest is Fixture {
 
     // ------------------------------------------------------------------ the burn's block budget
 
-    function testBurnLimitIsTheAnchorMovedByTheBoundAndTheAnchorIsTheBlocksFirstPrice() public {
+    /// @dev A block burns once: the tranche anchors at the price it finds, the limit is that anchor moved by
+    /// the bound, and a second tranche in the block is refused by name although the price is still inside the
+    /// bound. The next block anchors afresh at the moved price and burns the rest.
+    function testBurnLimitIsTheAnchorMovedByTheBoundAndABlockBurnsOnce() public {
         bytes32 subject = pages.subjectOf(carol);
         vm.prank(alice);
         pages.buy(subject, 100, type(uint256).max);
         (uint160 limit, uint160 current, bool zeroForOne) = pages.burnLimit();
-        assertTrue(pages.burnAnchorBlock() != block.number, "no anchor before the block's first burn");
+        assertTrue(pages.burnAnchorBlock() != block.number, "no anchor before the block's burn");
         uint256 expected = zeroForOne
             ? uint256(current) * (10_000 - pages.BURN_SQRT_BPS()) / 10_000
             : uint256(current) * (10_000 + pages.BURN_SQRT_BPS()) / 10_000;
@@ -665,18 +668,35 @@ contract PagesEdgesTest is Fixture {
         (uint256 spent,) = pages.burnPending(half);
         assertEq(spent, half);
         assertEq(pages.burnAnchorBlock(), block.number);
-        assertEq(pages.burnAnchorSqrtPrice(), current, "the anchor is the price the first burn found");
+        assertEq(pages.burnAnchorSqrtPrice(), current, "the anchor is the price the burn found");
         (uint160 limit2, uint160 moved,) = pages.burnLimit();
-        assertEq(limit2, limit, "the second burn in the block measures from the same anchor");
+        assertEq(limit2, limit, "the limit holds for the rest of the block");
         assertTrue(zeroForOne ? moved < current : moved > current, "the burn moved the price");
         assertTrue(zeroForOne ? moved > limit : moved < limit, "but not past the bound");
         uint256 rest = pages.pendingBurn();
+        assertGt(rest, 0);
+        // the price is inside the bound, yet the block has burned: every further tranche is refused by name
+        vm.expectRevert(MarginaliaPages.BurnBudgetSpent.selector);
+        pages.burnPending(rest);
+        vm.expectRevert(MarginaliaPages.BurnBudgetSpent.selector);
+        pages.burnPending(1);
+        assertEq(pages.pendingBurn(), rest, "a refused tranche stays queued");
+        assertEq(pages.burnAnchorSqrtPrice(), current, "a refusal does not move the anchor");
+        // the next block anchors at the moved price and the rest fits its bound
+        vm.roll(block.number + 1);
+        (uint160 limit3, uint160 current3,) = pages.burnLimit();
+        assertEq(current3, moved, "a new block measures from where the last burn left the price");
+        assertTrue(zeroForOne ? limit3 < limit : limit3 > limit, "so its limit is past the old one");
         (spent,) = pages.burnPending(rest);
         assertEq(spent, rest);
         assertEq(pages.pendingBurn(), 0);
+        assertEq(pages.burnAnchorBlock(), block.number);
+        assertEq(pages.burnAnchorSqrtPrice(), moved);
     }
 
-    function testExternalTradePastTheBoundSpendsTheBlocksBudgetByNameUntilTheNextBlock() public {
+    function testABlockThatBurnedRefusesAgainAfterAnExternalPushAndTheNextBlockAnchorsAtThePushedPrice()
+        public
+    {
         bytes32 subject = pages.subjectOf(carol);
         vm.prank(alice);
         pages.buy(subject, 100, type(uint256).max);

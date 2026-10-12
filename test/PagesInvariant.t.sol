@@ -68,6 +68,9 @@ contract PagesHandler is Test {
     uint256 public burns;
     uint256 public partialFills;
     uint256 public budgetRefusals;
+    uint256 public blockRefusals;
+    /// @dev Tranches the pool took in each block: the market promises at most one.
+    mapping(uint256 => uint256) public burnsInBlock;
 
     constructor(
         MarginaliaPages pages_,
@@ -474,8 +477,9 @@ contract PagesHandler is Test {
         recycles++;
     }
 
-    /// @dev A burn tranche: a quiet buy of MARG bounded by the block's price budget. The pool takes what fits
-    /// under the bound, the rest stays queued; a block whose budget is spent refuses by name.
+    /// @dev A burn tranche: a quiet buy of MARG bounded by the block's price budget. A block burns once: the
+    /// pool takes what fits under the bound from the price the tranche found, the rest stays queued, and any
+    /// further tranche in the block is refused by name whatever the price has since become.
     function burn(uint256 amountSeed) external {
         uint256 pending = pages.pendingBurn();
         if (pending == 0) {
@@ -492,6 +496,31 @@ contract PagesHandler is Test {
             MarginaliaPages.InsufficientBurn.selector
         );
         (uint160 limit, uint160 current, bool zeroForOne) = pages.burnLimit();
+        if (pages.burnAnchorBlock() == block.number) {
+            // a block burns once: the whole queue and one wei are refused by name whatever the price reads,
+            // and the refusal leaves the anchor, the queue and the pool alone
+            assertEq(burnsInBlock[block.number], 1, "an anchored block is one that burned here");
+            uint160 anchor = pages.burnAnchorSqrtPrice();
+            uint256 poolBefore = imd.balanceOf(manager);
+            _refused(
+                actors[3],
+                abi.encodeCall(MarginaliaPages.burnPending, (pending)),
+                MarginaliaPages.BurnBudgetSpent.selector
+            );
+            _refused(
+                actors[3],
+                abi.encodeCall(MarginaliaPages.burnPending, (1)),
+                MarginaliaPages.BurnBudgetSpent.selector
+            );
+            assertEq(pages.pendingBurn(), pending, "a refused tranche stays queued");
+            assertEq(pages.burnAnchorSqrtPrice(), anchor, "a refusal leaves the anchor");
+            assertEq(imd.balanceOf(manager), poolBefore, "and the pool");
+            (uint160 limitStill,,) = pages.burnLimit();
+            assertEq(limitStill, limit, "the limit holds for the rest of the block");
+            blockRefusals++;
+            return;
+        }
+        assertEq(burnsInBlock[block.number], 0, "a block without an anchor has not burned");
         if (zeroForOne ? current <= limit : current >= limit) {
             _refused(
                 actors[3],
@@ -534,6 +563,9 @@ contract PagesHandler is Test {
             assertEq(after_, limit, "a partial fill stops exactly at the bound");
             partialFills++;
         }
+        assertEq(pages.burnAnchorSqrtPrice(), current, "the anchor is the price the tranche found");
+        burnsInBlock[block.number]++;
+        assertEq(burnsInBlock[block.number], 1, "a block burns once");
         ghostPendingBurn -= spent;
         ghostOut += spent;
         ghostImdBurned += spent;
